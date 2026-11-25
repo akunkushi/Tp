@@ -1,0 +1,1353 @@
+--[[
+    TD Macro v2 (Delta Mobile)
+    - Record : Place, Upgrade, Sell, Target tower (hanya yang BERHASIL)
+    - Play   : memutar ulang berdasarkan wave + waktu (disesuaikan speed game)
+    - Save / Load banyak makro (folder TDMacro)
+    - Auto Play makro terpilih saat rejoin / match baru
+    - Auto Speed x1.5 / x2, Auto Replay match, Auto Vote difficulty
+]]
+
+----------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------
+local CONFIG = {
+    RemoteFolder  = "Remotes",
+    PlaceRemote   = "PlaceTower",
+    UpgradeRemote = "UpgradeTower",
+    SellRemote    = "SellTower",
+    TargetRemote  = "SetTargetMode",
+    MatchRemote   = "MatchAction",
+    VoteRemote    = "DifficultyVote",
+    SpeedRemote   = "GameSpeed",       -- langsung di ReplicatedStorage
+
+    RetryDelay      = 0.4,
+    PlaceMaxTries   = 0,    -- 0 = tanpa batas (tunggu cash)
+    UpgradeMaxTries = 200,  -- ~80 detik, lalu dilewati
+    SellMaxTries    = 10,
+
+    -- Upgrade/Sell yang mengembalikan nil dianggap berhasil
+    NilIsSuccess = true,
+
+    MacroDir     = "TDMacro",
+    SettingsFile = "TDMacro_Settings.json",
+    LegacyFile   = "TDMacro_Place.json",
+
+    CashNames  = {"cash", "money", "coins", "gold"},
+    WaveNames  = {"wave"},
+    SpeedNames = {"gamespeed", "speed"},
+
+    -- Override manual (opsional):
+    -- GetCash  = function() return game.Players.LocalPlayer.leaderstats.Cash.Value end,
+    -- GetWave  = function() return game.ReplicatedStorage.Wave.Value end,
+    -- GetSpeed = function() return game.ReplicatedStorage.GameSpeedValue.Value end,
+    -- IsSuccess        = function(result) return result == true end,
+    -- IsSuccessUpgrade = function(result) return result ~= false end,
+    -- IsSuccessSell    = function(result) return result ~= false end,
+    -- IsMatchEnded     = function() return false end,
+}
+
+local DIFFS = {"Easy", "Medium", "Hard", "Insane", "Nightmare"}
+
+----------------------------------------------------------------
+-- SERVICES
+----------------------------------------------------------------
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local HttpService       = game:GetService("HttpService")
+local CoreGui           = game:GetService("CoreGui")
+local LocalPlayer       = Players.LocalPlayer
+
+local env = (getgenv and getgenv()) or _G
+if env.__TDMacroCleanup then pcall(env.__TDMacroCleanup) end
+
+local alive = true
+local connections = {}
+local function track(c) table.insert(connections, c) return c end
+
+----------------------------------------------------------------
+-- STATE
+----------------------------------------------------------------
+local state = { wave = 0, waveTime = 0, cash = nil, speed = 1, speedDetected = nil }
+local waveDetected = false
+local firedSpeed = nil
+local speedMode = "auto"
+local recording, playing = false, false
+local playToken = 0
+local steps = {}
+local towerCount = 0
+local towerInstances = {}   -- id -> instance
+local instToId = {}         -- instance -> id
+local active = {}           -- id -> {name, pos} (tower yang masih hidup, saat record)
+local upgCount = {}
+local claimed = {}
+local placeInfo, placedOk = {}, {}
+
+local settings = {
+    autoPlay   = false,
+    autoReplay = false,
+    autoSpeed  = 0,        -- 0 / 1.5 / 2
+    autoVote   = false,
+    difficulty = "Medium",
+    macro      = "",
+    index      = {},       -- cadangan jika executor tanpa listfiles
+}
+
+-- forward declaration
+local playMacro, stopPlay, onNewMatch, voteBurst
+
+----------------------------------------------------------------
+-- UI
+----------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "TDMacroUI"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+pcall(function() gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling end)
+
+do
+    local done = false
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and h then gui.Parent = h done = true end
+    end
+    if not done then
+        pcall(function() gui.Parent = CoreGui end)
+        if not gui.Parent then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+    end
+end
+
+local function corner(o, r)
+    local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, r or 6) c.Parent = o
+end
+
+local C_GRAY   = Color3.fromRGB(70, 75, 92)
+local C_ON     = Color3.fromRGB(45, 160, 90)
+local C_PANEL  = Color3.fromRGB(38, 42, 54)
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.new(0, 300, 0, 322)
+main.Position = UDim2.new(0, 10, 0.2, 0)
+main.BackgroundColor3 = Color3.fromRGB(24, 26, 33)
+main.BorderSizePixel = 0
+main.Parent = gui
+corner(main, 8)
+
+local title = Instance.new("Frame")
+title.Size = UDim2.new(1, 0, 0, 28)
+title.BackgroundColor3 = C_PANEL
+title.BorderSizePixel = 0
+title.Parent = main
+corner(title, 8)
+
+local titleText = Instance.new("TextLabel")
+titleText.Size = UDim2.new(1, -40, 1, 0)
+titleText.Position = UDim2.new(0, 10, 0, 0)
+titleText.BackgroundTransparency = 1
+titleText.Text = "TD Macro v2"
+titleText.TextXAlignment = Enum.TextXAlignment.Left
+titleText.TextColor3 = Color3.fromRGB(235, 235, 245)
+titleText.Font = Enum.Font.GothamBold
+titleText.TextSize = 14
+titleText.Parent = title
+
+local minBtn = Instance.new("TextButton")
+minBtn.Size = UDim2.new(0, 28, 0, 22)
+minBtn.Position = UDim2.new(1, -32, 0, 3)
+minBtn.BackgroundColor3 = C_GRAY
+minBtn.Text = "–"
+minBtn.TextColor3 = Color3.new(1, 1, 1)
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 16
+minBtn.Parent = title
+corner(minBtn, 5)
+
+local body = Instance.new("Frame")
+body.Position = UDim2.new(0, 0, 0, 28)
+body.Size = UDim2.new(1, 0, 1, -28)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+local function makeBtn(parent, text, x, y, w, h, color)
+    local b = Instance.new("TextButton")
+    b.Position = UDim2.new(0, x, 0, y)
+    b.Size = UDim2.new(0, w, 0, h)
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+    b.Parent = parent
+    corner(b, 6)
+    return b
+end
+
+local function makeFrame(parent, y, h)
+    local f = Instance.new("Frame")
+    f.Position = UDim2.new(0, 0, 0, y)
+    f.Size = UDim2.new(1, 0, 0, h)
+    f.BackgroundTransparency = 1
+    f.Parent = parent
+    return f
+end
+
+-- Tab
+local tabMacro = makeFrame(body, 32, 126)
+local tabAuto  = makeFrame(body, 32, 126)
+tabAuto.Visible = false
+
+local tabBtnMacro = makeBtn(body, "Makro", 8, 4, 138, 24, C_ON)
+local tabBtnAuto  = makeBtn(body, "Auto", 154, 4, 138, 24, C_GRAY)
+tabBtnMacro.TextSize = 12
+tabBtnAuto.TextSize = 12
+
+local function showTab(which)
+    tabMacro.Visible = (which == "macro")
+    tabAuto.Visible  = (which == "auto")
+    tabBtnMacro.BackgroundColor3 = (which == "macro") and C_ON or C_GRAY
+    tabBtnAuto.BackgroundColor3  = (which == "auto") and C_ON or C_GRAY
+end
+tabBtnMacro.MouseButton1Click:Connect(function() showTab("macro") end)
+tabBtnAuto.MouseButton1Click:Connect(function() showTab("auto") end)
+
+-- Tab Makro
+local recBtn   = makeBtn(tabMacro, "● Record", 8, 0, 138, 32, Color3.fromRGB(200, 55, 55))
+local playBtn  = makeBtn(tabMacro, "▶ Play", 154, 0, 138, 32, C_ON)
+local speedBtn = makeBtn(tabMacro, "Speed: Auto", 198, 36, 94, 20, C_GRAY)
+speedBtn.TextSize = 11
+
+local info = Instance.new("TextLabel")
+info.Position = UDim2.new(0, 8, 0, 36)
+info.Size = UDim2.new(0, 186, 0, 20)
+info.BackgroundTransparency = 1
+info.TextXAlignment = Enum.TextXAlignment.Left
+info.TextColor3 = Color3.fromRGB(190, 200, 225)
+info.Font = Enum.Font.Code
+info.TextSize = 11
+info.Text = "Wave - | Cash - | x1"
+info.Parent = tabMacro
+
+local prevBtn = makeBtn(tabMacro, "◀", 8, 62, 28, 24, C_GRAY)
+local nextBtn = makeBtn(tabMacro, "▶", 264, 62, 28, 24, C_GRAY)
+
+local macroLabel = Instance.new("TextLabel")
+macroLabel.Position = UDim2.new(0, 40, 0, 62)
+macroLabel.Size = UDim2.new(0, 220, 0, 24)
+macroLabel.BackgroundColor3 = C_PANEL
+macroLabel.TextColor3 = Color3.fromRGB(225, 230, 245)
+macroLabel.Font = Enum.Font.Gotham
+macroLabel.TextSize = 11
+macroLabel.TextTruncate = Enum.TextTruncate.AtEnd
+macroLabel.Text = "Belum ada makro"
+macroLabel.Parent = tabMacro
+corner(macroLabel, 6)
+
+local nameBox = Instance.new("TextBox")
+nameBox.Position = UDim2.new(0, 8, 0, 92)
+nameBox.Size = UDim2.new(0, 160, 0, 24)
+nameBox.BackgroundColor3 = C_PANEL
+nameBox.TextColor3 = Color3.new(1, 1, 1)
+nameBox.PlaceholderText = "nama makro"
+nameBox.PlaceholderColor3 = Color3.fromRGB(130, 135, 150)
+nameBox.Text = ""
+nameBox.ClearTextOnFocus = false
+nameBox.Font = Enum.Font.Gotham
+nameBox.TextSize = 12
+nameBox.Parent = tabMacro
+corner(nameBox, 6)
+
+local saveBtn = makeBtn(tabMacro, "Save", 172, 92, 58, 24, C_ON)
+local delBtn  = makeBtn(tabMacro, "Del", 234, 92, 58, 24, Color3.fromRGB(200, 55, 55))
+saveBtn.TextSize = 12
+delBtn.TextSize = 12
+
+-- Console
+local console = Instance.new("ScrollingFrame")
+console.Position = UDim2.new(0, 8, 0, 162)
+console.Size = UDim2.new(0, 284, 0, 124)
+console.BackgroundColor3 = Color3.fromRGB(14, 15, 20)
+console.BorderSizePixel = 0
+console.ScrollBarThickness = 4
+console.CanvasSize = UDim2.new(0, 0, 0, 0)
+console.AutomaticCanvasSize = Enum.AutomaticSize.Y
+console.Parent = body
+corner(console, 6)
+
+local layout = Instance.new("UIListLayout")
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Padding = UDim.new(0, 1)
+layout.Parent = console
+
+local lineOrder = 0
+local function addLine(text, color)
+    lineOrder = lineOrder + 1
+    local l = Instance.new("TextLabel")
+    l.LayoutOrder = lineOrder
+    l.Size = UDim2.new(1, -6, 0, 0)
+    l.AutomaticSize = Enum.AutomaticSize.Y
+    l.BackgroundTransparency = 1
+    l.TextWrapped = true
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextYAlignment = Enum.TextYAlignment.Top
+    l.Font = Enum.Font.Code
+    l.TextSize = 11
+    l.TextColor3 = color or Color3.fromRGB(210, 215, 230)
+    l.Text = text
+    l.Parent = console
+    local count = 0
+    for _, k in ipairs(console:GetChildren()) do
+        if k:IsA("TextLabel") then count = count + 1 end
+    end
+    if count > 80 then
+        for _, k in ipairs(console:GetChildren()) do
+            if k:IsA("TextLabel") then k:Destroy() break end
+        end
+    end
+    task.defer(function()
+        pcall(function() console.CanvasPosition = Vector2.new(0, 1e6) end)
+    end)
+end
+
+local COL = {
+    ok   = Color3.fromRGB(110, 230, 150),
+    bad  = Color3.fromRGB(255, 120, 120),
+    warn = Color3.fromRGB(255, 205, 100),
+}
+
+local function fmtCash(c) return c and tostring(math.floor(c)) or "?" end
+
+local function log(msg, color)
+    local line = string.format("[W%s %.1fs $%s] %s",
+        tostring(state.wave), state.waveTime, fmtCash(state.cash), msg)
+    print("[TDMacro] " .. line)
+    addLine(line, color)
+end
+
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    body.Visible = not minimized
+    main.Size = minimized and UDim2.new(0, 150, 0, 28) or UDim2.new(0, 300, 0, 322)
+    minBtn.Text = minimized and "+" or "–"
+end)
+
+-- Drag hanya dari title bar (tidak memblokir input game)
+do
+    local dragging, dragStart, startPos
+    track(title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                      startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+end
+
+local function refreshButtons()
+    recBtn.Text  = recording and "■ Stop Rec" or "● Record"
+    playBtn.Text = playing and "■ Stop" or "▶ Play"
+end
+
+----------------------------------------------------------------
+-- DETEKSI CASH / WAVE / SPEED
+----------------------------------------------------------------
+local function parseNum(s)
+    if type(s) == "number" then return s end
+    s = tostring(s):gsub(",", "")
+    local n = s:match("%-?%d+%.?%d*")
+    return n and tonumber(n) or nil
+end
+
+local function hasName(name, pats, exact)
+    local n = string.lower(name)
+    for _, p in ipairs(pats) do
+        if exact then
+            if n == p then return true end
+        elseif string.find(n, p, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function readAny(v)
+    if typeof(v) == "Instance" then
+        local ok, val = pcall(function() return v.Value end)
+        if not ok then return nil end
+        v = val
+    end
+    if type(v) == "number" then return v end
+    if type(v) == "string" then return parseNum(v) end
+    return nil
+end
+
+local function makeFinder(label, pats, exactOnly)
+    local fn, lastSearch = nil, 0
+
+    local function search()
+        for pass = 1, (exactOnly and 1 or 2) do
+            local exact = (pass == 1)
+            for _, root in ipairs({LocalPlayer, ReplicatedStorage}) do
+                for _, d in ipairs(root:GetDescendants()) do
+                    if d:IsA("ValueBase") and hasName(d.Name, pats, exact) and readAny(d) ~= nil then
+                        log(label .. " terdeteksi: " .. d:GetFullName(), COL.warn)
+                        return function() return readAny(d) end
+                    end
+                end
+            end
+            for _, root in ipairs({LocalPlayer, ReplicatedStorage, workspace}) do
+                for k, v in pairs(root:GetAttributes()) do
+                    if hasName(k, pats, exact) and readAny(v) ~= nil then
+                        log(label .. " terdeteksi: attribute " .. k .. " di " .. root.Name, COL.warn)
+                        return function() return readAny(root:GetAttribute(k)) end
+                    end
+                end
+            end
+            local pg = LocalPlayer:FindFirstChild("PlayerGui")
+            if pg then
+                for _, d in ipairs(pg:GetDescendants()) do
+                    if (d:IsA("TextLabel") or d:IsA("TextButton"))
+                    and hasName(d.Name, pats, exact)
+                    and not d:IsDescendantOf(gui)
+                    and parseNum(d.Text) ~= nil then
+                        log(label .. " terdeteksi: UI " .. d:GetFullName(), COL.warn)
+                        return function() return parseNum(d.Text) end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    return function()
+        if fn then
+            local ok, v = pcall(fn)
+            if ok and v ~= nil then return v end
+            fn = nil
+        end
+        if tick() - lastSearch > 3 then
+            lastSearch = tick()
+            local ok, f = pcall(search)
+            if ok and f then
+                fn = f
+                local ok2, v = pcall(fn)
+                if ok2 then return v end
+            end
+        end
+        return nil
+    end
+end
+
+local findCash  = makeFinder("Cash",  CONFIG.CashNames)
+local findWave  = makeFinder("Wave",  CONFIG.WaveNames)
+local findSpeed = makeFinder("Speed", CONFIG.SpeedNames, true)
+
+local function safeCall(f, fallback)
+    local ok, v = pcall(f)
+    if ok and v ~= nil then return readAny(v) or v end
+    return fallback
+end
+
+----------------------------------------------------------------
+-- POLLING + WAKTU (tidak terpengaruh speed)
+----------------------------------------------------------------
+track(RunService.Heartbeat:Connect(function(dt)
+    state.waveTime = state.waveTime + dt * state.speed
+end))
+
+task.spawn(function()
+    local lastNewMatch = 0
+    while alive do
+        local c = CONFIG.GetCash and safeCall(CONFIG.GetCash) or findCash()
+        if type(c) == "number" then state.cash = c end
+
+        local s = CONFIG.GetSpeed and safeCall(CONFIG.GetSpeed) or findSpeed()
+        if type(s) == "number" and s >= 0.25 and s <= 10 then
+            state.speedDetected = s
+        else
+            state.speedDetected = nil
+        end
+
+        if type(speedMode) == "number" then
+            state.speed = speedMode
+        elseif state.speedDetected then
+            state.speed = state.speedDetected
+        elseif settings.autoSpeed > 0 and firedSpeed then
+            state.speed = firedSpeed
+        else
+            state.speed = 1
+        end
+
+        local w = CONFIG.GetWave and safeCall(CONFIG.GetWave) or findWave()
+        if type(w) == "number" then
+            waveDetected = true
+            if w ~= state.wave then
+                local prev = state.wave
+                state.wave = w
+                state.waveTime = 0
+                log("Wave berganti -> " .. tostring(w))
+                -- wave turun ke awal = match baru
+                if w < prev and w <= 1 and tick() - lastNewMatch > 5 then
+                    lastNewMatch = tick()
+                    if onNewMatch then task.spawn(onNewMatch) end
+                end
+            end
+        end
+
+        info.Text = string.format("Wave %s | Cash %s | x%s%s",
+            tostring(state.wave), fmtCash(state.cash), tostring(state.speed),
+            type(speedMode) == "number" and "" or " (auto)")
+        task.wait(0.1)
+    end
+end)
+
+speedBtn.MouseButton1Click:Connect(function()
+    if speedMode == "auto" then speedMode = 1
+    elseif speedMode == 1 then speedMode = 2
+    elseif speedMode == 2 then speedMode = 3
+    else speedMode = "auto" end
+    speedBtn.Text = "Speed: " .. (speedMode == "auto" and "Auto" or ("x" .. speedMode))
+    log("Mode speed: " .. tostring(speedMode))
+end)
+
+----------------------------------------------------------------
+-- REMOTE
+----------------------------------------------------------------
+local RemoteFolder = ReplicatedStorage:WaitForChild(CONFIG.RemoteFolder, 10)
+local function getRemote(name)
+    return RemoteFolder and RemoteFolder:FindFirstChild(name)
+end
+
+local PlaceRemote   = RemoteFolder and RemoteFolder:WaitForChild(CONFIG.PlaceRemote, 10)
+local UpgradeRemote = RemoteFolder and RemoteFolder:WaitForChild(CONFIG.UpgradeRemote, 5)
+local SellRemote    = RemoteFolder and RemoteFolder:WaitForChild(CONFIG.SellRemote, 5)
+local TargetRemote  = RemoteFolder and RemoteFolder:WaitForChild(CONFIG.TargetRemote, 5)
+
+if not PlaceRemote   then log("Remote PlaceTower TIDAK ketemu! Cek CONFIG.", COL.bad) end
+if not UpgradeRemote then log("Remote UpgradeTower tidak ketemu.", COL.bad) end
+if not SellRemote    then log("Remote SellTower tidak ketemu.", COL.bad) end
+if not TargetRemote  then log("Remote SetTargetMode tidak ketemu.", COL.bad) end
+
+local FAIL_WORDS = {"not enough", "insufficient", "fail", "cannot", "can't", "invalid", "error", "limit", "max", "too "}
+local function isSuccess(res, kind)
+    local custom
+    if kind == "upgrade" then custom = CONFIG.IsSuccessUpgrade
+    elseif kind == "sell" then custom = CONFIG.IsSuccessSell
+    else custom = CONFIG.IsSuccess end
+    if custom then
+        local ok, v = pcall(custom, res)
+        return ok and v and true or false
+    end
+    if res == nil then
+        return (kind == "upgrade" or kind == "sell") and CONFIG.NilIsSuccess and true or false
+    end
+    if res == false then return false end
+    if type(res) == "table" then
+        if res.success == false or res.Success == false or res.ok == false then return false end
+    end
+    if type(res) == "string" then
+        local l = string.lower(res)
+        for _, w in ipairs(FAIL_WORDS) do
+            if string.find(l, w, 1, true) then return false end
+        end
+    end
+    return true
+end
+
+-- Cari instance tower di workspace.Towers (milik sendiri diprioritaskan)
+local function findTowerNear(name, pos)
+    local root = workspace:FindFirstChild("Towers") or workspace
+    local lname = string.lower(name)
+    local myPrefix = string.lower(LocalPlayer.Name) .. "_"
+    local best, bestD, bestOwn
+    for pass = 1, 2 do -- pass 1: nama cocok, pass 2: hanya posisi
+        for _, inst in ipairs(root:GetChildren()) do
+            if (inst:IsA("Model") or inst:IsA("BasePart")) and not claimed[inst] then
+                local iname = string.lower(inst.Name)
+                if pass == 2 or string.find(iname, lname, 1, true) then
+                    local ok, cf = pcall(function() return inst:GetPivot() end)
+                    if ok then
+                        local p = cf.Position
+                        local d = Vector2.new(p.X - pos.X, p.Z - pos.Z).Magnitude
+                        local own = string.sub(iname, 1, #myPrefix) == myPrefix
+                        if d < 4 then
+                            if not best or (own and not bestOwn) or (own == bestOwn and d < bestD) then
+                                best, bestD, bestOwn = inst, d, own
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if best then break end
+    end
+    if best then claimed[best] = true end
+    return best
+end
+
+local function bindTower(id, name, pos)
+    task.spawn(function()
+        for _ = 1, 30 do
+            if not alive then return end
+            local inst = findTowerNear(name, pos)
+            if inst then
+                towerInstances[id] = inst
+                instToId[inst] = id
+                return
+            end
+            task.wait(0.1)
+        end
+        log("Instance tower #" .. tostring(id) .. " tidak ketemu (dicari lewat posisi).", COL.warn)
+    end)
+end
+
+-- Instance tower -> id rekaman (saat record)
+local function idFromInstance(inst)
+    if typeof(inst) ~= "Instance" then return nil end
+    if instToId[inst] then return instToId[inst] end
+    local ok, cf = pcall(function() return inst:GetPivot() end)
+    if not ok then return nil end
+    local p = cf.Position
+    local nm = string.lower(inst.Name)
+    local best, bd
+    for id, i in pairs(active) do
+        if string.find(nm, string.lower(i.name), 1, true) then
+            local d = Vector2.new(p.X - i.pos.X, p.Z - i.pos.Z).Magnitude
+            if d < 4 and (not bd or d < bd) then best, bd = id, d end
+        end
+    end
+    return best
+end
+
+----------------------------------------------------------------
+-- SIMPAN / MUAT (settings + makro)
+----------------------------------------------------------------
+local function readJson(path)
+    if isfile and readfile and isfile(path) then
+        local ok, d = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
+        if ok and type(d) == "table" then return d end
+    end
+    return nil
+end
+
+local function writeJson(path, tbl)
+    if not writefile then return false end
+    local ok = pcall(function() writefile(path, HttpService:JSONEncode(tbl)) end)
+    return ok
+end
+
+local function saveSettings() writeJson(CONFIG.SettingsFile, settings) end
+
+local function loadSettings()
+    local d = readJson(CONFIG.SettingsFile)
+    if d then
+        for k, v in pairs(d) do
+            if settings[k] ~= nil then settings[k] = v end
+        end
+    end
+    if type(settings.index) ~= "table" then settings.index = {} end
+    if type(settings.autoSpeed) ~= "number" then settings.autoSpeed = 0 end
+    if not table.find(DIFFS, settings.difficulty) then settings.difficulty = "Medium" end
+end
+
+local function ensureDir()
+    if makefolder and isfolder and not isfolder(CONFIG.MacroDir) then
+        pcall(makefolder, CONFIG.MacroDir)
+    end
+end
+
+local function sanitize(n)
+    n = tostring(n or "")
+    n = n:gsub("[^%w_%-%s]", "")
+    n = n:gsub("^%s+", ""):gsub("%s+$", "")
+    return n
+end
+
+local function macroPath(name) return CONFIG.MacroDir .. "/" .. name .. ".json" end
+
+local function addIndex(name)
+    if not table.find(settings.index, name) then table.insert(settings.index, name) end
+end
+local function removeIndex(name)
+    local i = table.find(settings.index, name)
+    if i then table.remove(settings.index, i) end
+end
+
+local function listMacros()
+    local out = {}
+    if listfiles and isfolder and isfolder(CONFIG.MacroDir) then
+        local ok, files = pcall(listfiles, CONFIG.MacroDir)
+        if ok and type(files) == "table" then
+            for _, f in ipairs(files) do
+                local n = tostring(f):match("([^/\\]+)%.json$")
+                if n then table.insert(out, n) end
+            end
+        end
+    else
+        for _, n in ipairs(settings.index) do table.insert(out, n) end
+    end
+    table.sort(out, function(a, b) return string.lower(a) < string.lower(b) end)
+    return out
+end
+
+local function summary(list)
+    local p, u, s, t = 0, 0, 0, 0
+    for _, st in ipairs(list) do
+        if st.type == "place" then p = p + 1
+        elseif st.type == "upgrade" then u = u + 1
+        elseif st.type == "sell" then s = s + 1
+        elseif st.type == "target" then t = t + 1 end
+    end
+    return string.format("%d place, %d upgrade, %d sell, %d target", p, u, s, t)
+end
+
+local macroList, macroIdx = {}, 0
+local function refreshMacroLabel()
+    macroList = listMacros()
+    macroIdx = table.find(macroList, settings.macro) or 0
+    if #macroList == 0 then
+        macroLabel.Text = "Belum ada makro tersimpan"
+    elseif macroIdx > 0 then
+        macroLabel.Text = string.format("%s (%d/%d) · %d step", settings.macro, macroIdx, #macroList, #steps)
+    else
+        macroLabel.Text = string.format("(pilih makro) 0/%d · %d step", #macroList, #steps)
+    end
+end
+
+local function saveMacro(name)
+    ensureDir()
+    local ok = writeJson(macroPath(name), { version = 2, steps = steps })
+    if ok then
+        addIndex(name)
+        settings.macro = name
+        nameBox.Text = name
+        saveSettings()
+        refreshMacroLabel()
+        log("Makro disimpan: " .. name .. " (" .. summary(steps) .. ")", COL.ok)
+    else
+        log("Gagal menyimpan makro (executor tanpa writefile?)", COL.bad)
+    end
+    return ok
+end
+
+local function loadMacro(name)
+    local d = readJson(macroPath(name))
+    if not d then log("Gagal memuat makro: " .. tostring(name), COL.bad) return false end
+    steps = d.steps or d -- format lama = array langsung
+    settings.macro = name
+    nameBox.Text = name
+    saveSettings()
+    refreshMacroLabel()
+    log("Makro dimuat: " .. name .. " (" .. summary(steps) .. ")", COL.ok)
+    return true
+end
+
+----------------------------------------------------------------
+-- RECORD (hook remote)
+----------------------------------------------------------------
+local Shared = env.__TDMacroShared2
+if not Shared then
+    Shared = { recording = false, map = {} }
+    env.__TDMacroShared2 = Shared
+
+    if hookmetamethod and getnamecallmethod and newcclosure and checkcaller then
+        local old
+        old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+            if Shared.recording and (method == "InvokeServer" or method == "FireServer") then
+                local kind = Shared.map[self]
+                if kind and not checkcaller() then
+                    local args = { ... }
+                    local st = Shared.state
+                    local wave, t = st.wave, st.waveTime
+                    local res = table.pack(old(self, ...))
+                    local cb = Shared.cb
+                    if cb then task.spawn(cb, kind, args, res, wave, t) end
+                    return table.unpack(res, 1, res.n)
+                end
+            end
+            return old(self, ...)
+        end))
+    else
+        task.defer(function()
+            log("Executor tidak support hookmetamethod, Record tidak bisa.", COL.bad)
+        end)
+    end
+end
+
+local function onRemoteInvoked(kind, args, res, wave, t)
+    if not recording then return end
+    local first = res[1]
+
+    if kind == "place" then
+        local name, pos, rot = args[1], args[2], args[3]
+        if type(name) ~= "string" or typeof(pos) ~= "Vector3" then return end
+        if not isSuccess(first, "place") then
+            log(string.format("GAGAL place %s (tidak direkam) | result: %s", name, tostring(first)), COL.bad)
+            return
+        end
+        if type(rot) ~= "number" and type(rot) ~= "string" then rot = 0 end
+        towerCount = towerCount + 1
+        local id = towerCount
+        table.insert(steps, {
+            type = "place", id = id, name = name,
+            x = pos.X, y = pos.Y, z = pos.Z, rot = rot,
+            wave = wave, t = t,
+        })
+        active[id] = { name = name, pos = pos }
+        bindTower(id, name, pos)
+        log(string.format("RECORD #%d place %s @ (%.1f, %.1f, %.1f) | wave %s t=%.1fs | result: %s",
+            id, name, pos.X, pos.Y, pos.Z, tostring(wave), t, tostring(first)), COL.ok)
+
+    elseif kind == "upgrade" then
+        local id = idFromInstance(args[1])
+        if not isSuccess(first, "upgrade") then
+            log("GAGAL upgrade (tidak direkam) | result: " .. tostring(first), COL.bad)
+            return
+        end
+        if not id then
+            log("Upgrade tower yang tidak dikenal (bukan dari record ini), dilewati.", COL.warn)
+            return
+        end
+        upgCount[id] = (upgCount[id] or 0) + 1
+        table.insert(steps, { type = "upgrade", id = id, wave = wave, t = t })
+        log(string.format("RECORD upgrade #%d (ke-%d) | wave %s t=%.1fs | result: %s",
+            id, upgCount[id], tostring(wave), t, tostring(first)), COL.ok)
+
+    elseif kind == "sell" then
+        local id = idFromInstance(args[1])
+        if not isSuccess(first, "sell") then
+            log("GAGAL sell (tidak direkam) | result: " .. tostring(first), COL.bad)
+            return
+        end
+        if not id then
+            log("Sell tower yang tidak dikenal (bukan dari record ini), dilewati.", COL.warn)
+            return
+        end
+        table.insert(steps, { type = "sell", id = id, wave = wave, t = t })
+        active[id] = nil
+        log(string.format("RECORD sell #%d | wave %s t=%.1fs | result: %s",
+            id, tostring(wave), t, tostring(first)), COL.ok)
+
+    elseif kind == "target" then
+        local id = idFromInstance(args[1])
+        local mode = args[2]
+        if not id or type(mode) ~= "string" then
+            log("Target tower tidak dikenal, dilewati.", COL.warn)
+            return
+        end
+        table.insert(steps, { type = "target", id = id, mode = mode, wave = wave, t = t })
+        log(string.format("RECORD target #%d -> %s | wave %s t=%.1fs", id, mode, tostring(wave), t), COL.ok)
+    end
+end
+
+do
+    local map = {}
+    if PlaceRemote   then map[PlaceRemote]   = "place"   end
+    if UpgradeRemote then map[UpgradeRemote] = "upgrade" end
+    if SellRemote    then map[SellRemote]    = "sell"    end
+    if TargetRemote  then map[TargetRemote]  = "target"  end
+    Shared.map = map
+end
+Shared.state = state
+Shared.cb = onRemoteInvoked
+Shared.recording = false
+
+local function startRecord()
+    steps = {}
+    towerCount = 0
+    towerInstances, instToId, active, upgCount, claimed = {}, {}, {}, {}, {}
+    state.waveTime = 0
+    recording = true
+    Shared.recording = true
+    refreshButtons()
+    refreshMacroLabel()
+    log("RECORD dimulai. Place/upgrade/sell/target seperti biasa.", COL.ok)
+end
+
+local function stopRecord()
+    recording = false
+    Shared.recording = false
+    refreshButtons()
+    log("RECORD selesai. " .. summary(steps), COL.ok)
+    if #steps > 0 then
+        local name = sanitize(nameBox.Text)
+        if name == "" then name = "Makro_" .. tostring(os.time()) end
+        saveMacro(name)
+    end
+end
+
+----------------------------------------------------------------
+-- PLAY
+----------------------------------------------------------------
+local function waitFor(cond, token)
+    while playing and playToken == token and not cond() do task.wait(0.05) end
+    return playing and playToken == token
+end
+
+local function resolveTower(id, token, timeout)
+    local deadline = tick() + (timeout or 3)
+    repeat
+        local inst = towerInstances[id]
+        if inst and inst.Parent then return inst end
+        local info = placeInfo[id]
+        if info and placedOk[id] then
+            local f = findTowerNear(info.name, Vector3.new(info.x, info.y, info.z))
+            if f then
+                towerInstances[id] = f
+                instToId[f] = id
+                return f
+            end
+        end
+        task.wait(0.1)
+    until tick() > deadline or not (playing and playToken == token)
+    return towerInstances[id]
+end
+
+local function retryCall(token, label, kind, maxTries, fn)
+    local tries = 0
+    while playing and playToken == token do
+        local ok, res = pcall(fn)
+        if ok and isSuccess(res, kind) then return true, res end
+        tries = tries + 1
+        if tries == 1 or tries % 10 == 0 then
+            log(string.format("%s gagal (percobaan %d), menunggu... result: %s",
+                label, tries, tostring(res)), COL.warn)
+        end
+        if maxTries > 0 and tries >= maxTries then return false, res end
+        task.wait(CONFIG.RetryDelay)
+    end
+    return false
+end
+
+local function runStep(i, s, token)
+    local total = #steps
+    if s.type == "place" then
+        if not PlaceRemote then return end
+        log(string.format("Step %d/%d: place %s (rekaman wave %s t=%.1fs)",
+            i, total, s.name, tostring(s.wave), s.t))
+        local pos = Vector3.new(s.x, s.y, s.z)
+        local ok, res = retryCall(token, "Place " .. s.name, "place", CONFIG.PlaceMaxTries, function()
+            return PlaceRemote:InvokeServer(s.name, pos, s.rot)
+        end)
+        if ok then
+            placedOk[s.id] = true
+            log(string.format("OK place #%s %s | result: %s", tostring(s.id), s.name, tostring(res)), COL.ok)
+            bindTower(s.id, s.name, pos)
+        end
+
+    elseif s.type == "upgrade" then
+        if not UpgradeRemote then return end
+        if not placedOk[s.id] then
+            log(string.format("Step %d/%d: upgrade #%s dilewati (tower belum/tidak ter-place)", i, total, tostring(s.id)), COL.warn)
+            return
+        end
+        local inst = resolveTower(s.id, token, 4)
+        if not inst then
+            log(string.format("Step %d/%d: upgrade #%s dilewati (instance tidak ketemu)", i, total, tostring(s.id)), COL.bad)
+            return
+        end
+        log(string.format("Step %d/%d: upgrade #%s", i, total, tostring(s.id)))
+        local ok, res = retryCall(token, "Upgrade #" .. tostring(s.id), "upgrade", CONFIG.UpgradeMaxTries, function()
+            return UpgradeRemote:InvokeServer(inst)
+        end)
+        if ok then
+            log(string.format("OK upgrade #%s | result: %s", tostring(s.id), tostring(res)), COL.ok)
+        elseif playing and playToken == token then
+            log(string.format("Upgrade #%s dilewati (batas percobaan) | result: %s", tostring(s.id), tostring(res)), COL.warn)
+        end
+
+    elseif s.type == "sell" then
+        if not SellRemote then return end
+        if not placedOk[s.id] then
+            log(string.format("Step %d/%d: sell #%s dilewati (tower tidak ada)", i, total, tostring(s.id)), COL.warn)
+            return
+        end
+        local inst = resolveTower(s.id, token, 4)
+        if not inst then
+            log(string.format("Step %d/%d: sell #%s dilewati (instance tidak ketemu)", i, total, tostring(s.id)), COL.bad)
+            return
+        end
+        log(string.format("Step %d/%d: sell #%s", i, total, tostring(s.id)))
+        local ok, res = retryCall(token, "Sell #" .. tostring(s.id), "sell", CONFIG.SellMaxTries, function()
+            return SellRemote:InvokeServer(inst)
+        end)
+        if ok then
+            placedOk[s.id] = false
+            towerInstances[s.id] = nil
+            log(string.format("OK sell #%s | result: %s", tostring(s.id), tostring(res)), COL.ok)
+        elseif playing and playToken == token then
+            log(string.format("Sell #%s gagal | result: %s", tostring(s.id), tostring(res)), COL.bad)
+        end
+
+    elseif s.type == "target" then
+        if not TargetRemote or not placedOk[s.id] then return end
+        local inst = resolveTower(s.id, token, 4)
+        if not inst then
+            log(string.format("Step %d/%d: target #%s dilewati (instance tidak ketemu)", i, total, tostring(s.id)), COL.bad)
+            return
+        end
+        pcall(function() TargetRemote:FireServer(inst, s.mode) end)
+        log(string.format("OK target #%s -> %s", tostring(s.id), tostring(s.mode)), COL.ok)
+    end
+end
+
+stopPlay = function(silent)
+    if not playing then return end
+    playing = false
+    playToken = playToken + 1
+    refreshButtons()
+    if not silent then log("PLAY dihentikan.", COL.warn) end
+end
+
+playMacro = function()
+    if #steps == 0 then
+        log("Belum ada rekaman / makro belum dimuat.", COL.bad)
+        return
+    end
+    if not PlaceRemote then log("Remote tidak ada.", COL.bad) return end
+
+    playToken = playToken + 1
+    local token = playToken
+    playing = true
+    towerInstances, instToId, claimed, placeInfo, placedOk = {}, {}, {}, {}, {}
+    for _, s in ipairs(steps) do
+        if s.type == "place" then placeInfo[s.id] = s end
+    end
+    state.waveTime = 0
+    refreshButtons()
+    log("PLAY mulai, " .. #steps .. " step (" .. summary(steps) .. ").", COL.ok)
+
+    task.spawn(function()
+        for i, s in ipairs(steps) do
+            if not (playing and playToken == token) then break end
+            local reached = waitFor(function()
+                return state.wave > s.wave or (state.wave == s.wave and state.waveTime >= s.t)
+            end, token)
+            if not reached then break end
+            runStep(i, s, token)
+        end
+        if playToken == token then
+            if playing then log("PLAY selesai.", COL.ok) end
+            playing = false
+            refreshButtons()
+        end
+    end)
+end
+
+onNewMatch = function()
+    towerInstances, instToId, claimed, active = {}, {}, {}, {}
+    log("Match baru terdeteksi.", COL.warn)
+    if settings.autoVote and voteBurst then voteBurst() end
+    if recording then return end
+    if playing then
+        stopPlay(true)
+        task.wait(0.3)
+        playMacro()
+    elseif settings.autoPlay and #steps > 0 then
+        playMacro()
+    end
+end
+
+----------------------------------------------------------------
+-- AUTO: SPEED, REPLAY, VOTE
+----------------------------------------------------------------
+-- Auto speed
+task.spawn(function()
+    local lastFire = 0
+    while alive do
+        local target = settings.autoSpeed
+        if type(target) == "number" and target > 0 then
+            local need
+            if state.speedDetected then
+                need = math.abs(state.speedDetected - target) > 0.01
+            else
+                need = (tick() - lastFire) > 5
+            end
+            if need and tick() - lastFire > 1.5 then
+                local ev = ReplicatedStorage:FindFirstChild(CONFIG.SpeedRemote)
+                if ev then
+                    pcall(function() ev:FireServer(target) end)
+                    lastFire = tick()
+                    firedSpeed = target
+                end
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- Auto replay (hanya saat match selesai)
+local END_WORDS = {"victory", "defeat", "game over", "you win", "you won", "you lose", "you lost",
+                   "match complete", "match over", "mission complete", "mission failed"}
+local AGAIN_WORDS = {"again", "play again", "replay"}
+
+local function guiVisible(o)
+    local cur = o
+    while cur and cur ~= game do
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        if cur:IsA("ScreenGui") then return cur.Enabled end
+        cur = cur.Parent
+    end
+    return true
+end
+
+local function detectMatchEnded()
+    if CONFIG.IsMatchEnded then
+        local ok, v = pcall(CONFIG.IsMatchEnded)
+        return ok and v and true or false, "custom"
+    end
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pg then return false end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and not d:IsDescendantOf(gui) then
+            local txt = d.Text
+            if type(txt) == "string" and txt ~= "" and guiVisible(d) then
+                local l = string.lower(txt)
+                for _, w in ipairs(END_WORDS) do
+                    if string.find(l, w, 1, true) then return true, d:GetFullName() end
+                end
+                if d:IsA("TextButton") then
+                    local trimmed = l:gsub("^%s+", ""):gsub("%s+$", "")
+                    for _, w in ipairs(AGAIN_WORDS) do
+                        if trimmed == w then return true, d:GetFullName() end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+task.spawn(function()
+    local hits, lastFire = 0, 0
+    while alive do
+        task.wait(1.5)
+        if settings.autoReplay then
+            local ok, ended, who = pcall(detectMatchEnded)
+            if ok and ended then
+                hits = hits + 1
+                if hits >= 2 and tick() - lastFire > 10 then
+                    lastFire = tick()
+                    local ev = getRemote(CONFIG.MatchRemote)
+                    if ev then
+                        pcall(function() ev:FireServer("Again") end)
+                        log("Match selesai (" .. tostring(who) .. ") -> Replay", COL.ok)
+                    else
+                        log("Remote MatchAction tidak ketemu.", COL.bad)
+                    end
+                end
+            else
+                hits = 0
+            end
+        else
+            hits = 0
+        end
+    end
+end)
+
+-- Auto vote difficulty
+local voteBusy = false
+voteBurst = function()
+    if voteBusy then return end
+    voteBusy = true
+    task.spawn(function()
+        for _ = 1, 3 do
+            if not alive or not settings.autoVote then break end
+            local ev = getRemote(CONFIG.VoteRemote)
+            if ev then
+                local d = settings.difficulty
+                pcall(function() ev:FireServer(d) end)
+                log("Vote difficulty: " .. tostring(d), COL.ok)
+            end
+            task.wait(1.5)
+        end
+        voteBusy = false
+    end)
+end
+
+task.spawn(function()
+    local last = 0
+    while alive do
+        task.wait(1)
+        -- sebelum match mulai (wave 0), ulangi vote tiap 3 detik
+        if settings.autoVote and waveDetected and state.wave <= 0 and tick() - last > 3 then
+            last = tick()
+            voteBurst()
+        end
+    end
+end)
+
+----------------------------------------------------------------
+-- TOMBOL
+----------------------------------------------------------------
+recBtn.MouseButton1Click:Connect(function()
+    if playing then log("Stop Play dulu.", COL.warn) return end
+    if recording then stopRecord() else startRecord() end
+end)
+
+playBtn.MouseButton1Click:Connect(function()
+    if recording then log("Stop Record dulu.", COL.warn) return end
+    if playing then stopPlay() else playMacro() end
+end)
+
+local function selectMacro(delta)
+    if recording or playing then log("Stop Record/Play dulu.", COL.warn) return end
+    refreshMacroLabel()
+    if #macroList == 0 then log("Belum ada makro tersimpan.", COL.warn) return end
+    local idx
+    if macroIdx == 0 then
+        idx = delta > 0 and 1 or #macroList
+    else
+        idx = ((macroIdx - 1 + delta) % #macroList) + 1
+    end
+    loadMacro(macroList[idx])
+end
+prevBtn.MouseButton1Click:Connect(function() selectMacro(-1) end)
+nextBtn.MouseButton1Click:Connect(function() selectMacro(1) end)
+
+saveBtn.MouseButton1Click:Connect(function()
+    if recording then log("Stop Record dulu.", COL.warn) return end
+    local name = sanitize(nameBox.Text)
+    if name == "" then log("Isi nama makro dulu.", COL.warn) return end
+    if #steps == 0 then log("Tidak ada step untuk disimpan.", COL.warn) return end
+    saveMacro(name)
+end)
+
+delBtn.MouseButton1Click:Connect(function()
+    local name = settings.macro
+    if name == "" then log("Pilih makro dulu (◀ ▶).", COL.warn) return end
+    if delfile then pcall(delfile, macroPath(name)) end
+    removeIndex(name)
+    settings.macro = ""
+    saveSettings()
+    refreshMacroLabel()
+    log("Makro dihapus: " .. name, COL.warn)
+end)
+
+-- Tab Auto
+local toggleRefresh = {}
+local function refreshToggles()
+    for _, f in ipairs(toggleRefresh) do f() end
+end
+
+local function mkToggle(label, y, w, getOn, onToggle)
+    local b = makeBtn(tabAuto, label, 8, y, w, 24, C_GRAY)
+    b.TextSize = 12
+    local function refresh()
+        local on = getOn()
+        b.Text = label .. ": " .. (on and "ON" or "OFF")
+        b.BackgroundColor3 = on and C_ON or C_GRAY
+    end
+    table.insert(toggleRefresh, refresh)
+    b.MouseButton1Click:Connect(function()
+        onToggle()
+        saveSettings()
+        refreshToggles()
+    end)
+    refresh()
+    return b
+end
+
+mkToggle("Auto Play (Rejoin)", 0, 284,
+    function() return settings.autoPlay end,
+    function() settings.autoPlay = not settings.autoPlay end)
+
+mkToggle("Auto Speed x1.5", 25, 284,
+    function() return settings.autoSpeed == 1.5 end,
+    function() settings.autoSpeed = (settings.autoSpeed == 1.5) and 0 or 1.5 end)
+
+mkToggle("Auto Speed x2", 50, 284,
+    function() return settings.autoSpeed == 2 end,
+    function() settings.autoSpeed = (settings.autoSpeed == 2) and 0 or 2 end)
+
+mkToggle("Auto Replay Match", 75, 284,
+    function() return settings.autoReplay end,
+    function() settings.autoReplay = not settings.autoReplay end)
+
+mkToggle("Auto Vote", 100, 190,
+    function() return settings.autoVote end,
+    function()
+        settings.autoVote = not settings.autoVote
+        if settings.autoVote then voteBurst() end
+    end)
+
+local diffBtn = makeBtn(tabAuto, settings.difficulty, 202, 100, 90, 24, C_GRAY)
+diffBtn.TextSize = 12
+diffBtn.MouseButton1Click:Connect(function()
+    local i = table.find(DIFFS, settings.difficulty) or 1
+    settings.difficulty = DIFFS[(i % #DIFFS) + 1]
+    diffBtn.Text = settings.difficulty
+    saveSettings()
+    if settings.autoVote then voteBurst() end
+end)
+
+----------------------------------------------------------------
+-- CLEANUP
+----------------------------------------------------------------
+env.__TDMacroCleanup = function()
+    alive = false
+    recording, playing = false, false
+    playToken = playToken + 1
+    if Shared then Shared.recording = false Shared.cb = nil Shared.map = {} end
+    for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+    pcall(function() gui:Destroy() end)
+end
+
+----------------------------------------------------------------
+-- STARTUP
+----------------------------------------------------------------
+loadSettings()
+ensureDir()
+
+-- impor file lama (tahap 1) jika belum ada makro
+if #listMacros() == 0 then
+    local legacy = readJson(CONFIG.LegacyFile)
+    if legacy and legacy[1] then
+        steps = legacy
+        saveMacro("Place_Lama")
+    end
+end
+
+do
+    local list = listMacros()
+    if settings.macro ~= "" and table.find(list, settings.macro) then
+        loadMacro(settings.macro)
+    else
+        settings.macro = ""
+        refreshMacroLabel()
+    end
+end
+
+refreshToggles()
+refreshButtons()
+log("TD Macro v2 siap." .. (#steps > 0 and (" Makro aktif: " .. settings.macro .. " (" .. #steps .. " step).") or ""), COL.ok)
+
+-- Auto play / auto vote saat script dimuat (rejoin)
+task.spawn(function()
+    task.wait(3)
+    if not alive then return end
+    if settings.autoVote then voteBurst() end
+    if settings.autoPlay then
+        if #steps > 0 then
+            log("Auto Play: memulai makro " .. settings.macro, COL.ok)
+            playMacro()
+        else
+            log("Auto Play aktif tapi belum ada makro dipilih.", COL.warn)
+        end
+    end
+end)
