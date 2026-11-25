@@ -7,6 +7,7 @@
     - Auto Speed x1.5 / x2, Auto Replay match, Auto Vote difficulty
     - FIX: wave tidak lagi terbaca dari panel pemilihan difficulty
     - FIX: makro yang di-delete tidak muncul lagi setelah rejoin
+    - UPDATE: jeda 3 detik sebelum menjalankan auto vote difficulty
 ]]
 
 ----------------------------------------------------------------
@@ -26,6 +27,7 @@ local CONFIG = {
     PlaceMaxTries   = 0,    -- 0 = tanpa batas (tunggu cash)
     UpgradeMaxTries = 200,  -- ~80 detik, lalu dilewati
     SellMaxTries    = 10,
+    VoteDelay       = 3,    -- jeda detik sebelum auto vote berjalan
 
     -- Upgrade/Sell yang mengembalikan nil dianggap berhasil
     NilIsSuccess = true,
@@ -106,7 +108,7 @@ local settings = {
 }
 
 -- forward declaration
-local playMacro, stopPlay, onNewMatch, voteBurst
+local playMacro, stopPlay, onNewMatch, voteBurst, scheduleVote
 
 ----------------------------------------------------------------
 -- UI
@@ -1293,8 +1295,10 @@ task.spawn(function()
     end
 end)
 
--- Auto vote difficulty
+-- Auto vote difficulty (dengan jeda sebelum eksekusi)
 local voteBusy = false
+local voteGen = 0
+
 voteBurst = function()
     if voteBusy then return end
     voteBusy = true
@@ -1313,14 +1317,27 @@ voteBurst = function()
     end)
 end
 
+scheduleVote = function(delay)
+    local dly = delay or CONFIG.VoteDelay
+    voteGen = voteGen + 1
+    local gen = voteGen
+    if dly > 0 then
+        log(string.format("Auto vote difficulty dijadwalkan dalam %ds...", dly), COL.warn)
+    end
+    task.delay(dly, function()
+        if not alive or gen ~= voteGen or not settings.autoVote then return end
+        voteBurst()
+    end)
+end
+
 task.spawn(function()
     local last = 0
     while alive do
         task.wait(1)
-        -- selama panel pilih difficulty tampil, ulangi vote tiap 3 detik
-        if settings.autoVote and isVoting() and tick() - last > 3 then
+        -- selama panel pilih difficulty tampil, beri jeda sebelum vote
+        if settings.autoVote and isVoting() and tick() - last > (CONFIG.VoteDelay + 3) then
             last = tick()
-            voteBurst()
+            scheduleVote(CONFIG.VoteDelay)
         end
     end
 end)
@@ -1412,7 +1429,7 @@ mkToggle("Auto Vote", 100, 190,
     function() return settings.autoVote end,
     function()
         settings.autoVote = not settings.autoVote
-        if settings.autoVote then voteBurst() end
+        if settings.autoVote then scheduleVote(CONFIG.VoteDelay) end
     end)
 
 local diffBtn = makeBtn(tabAuto, settings.difficulty, 202, 100, 90, 24, C_GRAY)
@@ -1422,7 +1439,7 @@ diffBtn.MouseButton1Click:Connect(function()
     settings.difficulty = DIFFS[(i % #DIFFS) + 1]
     diffBtn.Text = settings.difficulty
     saveSettings()
-    if settings.autoVote then voteBurst() end
+    if settings.autoVote then scheduleVote(CONFIG.VoteDelay) end
 end)
 
 ----------------------------------------------------------------
@@ -1430,6 +1447,7 @@ end)
 ----------------------------------------------------------------
 env.__TDMacroCleanup = function()
     alive = false
+    voteGen = voteGen + 1
     recording, playing = false, false
     playToken = playToken + 1
     if Shared then Shared.recording = false Shared.cb = nil Shared.map = {} end
