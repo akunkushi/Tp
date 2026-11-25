@@ -1,10 +1,12 @@
 --[[
-    TD Macro v2 (Delta Mobile)
+    TD Macro v2.2 (Delta Mobile)
     - Record : Place, Upgrade, Sell, Target tower (hanya yang BERHASIL)
     - Play   : memutar ulang berdasarkan wave + waktu (disesuaikan speed game)
     - Save / Load banyak makro (folder TDMacro)
     - Auto Play makro terpilih saat rejoin / match baru
     - Auto Speed x1.5 / x2, Auto Replay match, Auto Vote difficulty
+    - FIX: wave tidak lagi terbaca dari panel pemilihan difficulty
+    - FIX: makro yang di-delete tidak muncul lagi setelah rejoin
 ]]
 
 ----------------------------------------------------------------
@@ -36,10 +38,17 @@ local CONFIG = {
     WaveNames  = {"wave"},
     SpeedNames = {"gamespeed", "speed"},
 
+    -- Nama panel pemilihan difficulty (dipakai untuk mendeteksi fase vote)
+    VotePanelName = "DifficultyVotePanel",
+
+    -- Label/objek yang namanya mengandung kata ini DIABAIKAN saat mencari wave
+    WaveRejectWords = {"difficulty", "vote", "lobby", "card", "reward", "panel"},
+
     -- Override manual (opsional):
     -- GetCash  = function() return game.Players.LocalPlayer.leaderstats.Cash.Value end,
     -- GetWave  = function() return game.ReplicatedStorage.Wave.Value end,
     -- GetSpeed = function() return game.ReplicatedStorage.GameSpeedValue.Value end,
+    -- IsVoting = function() return false end,
     -- IsSuccess        = function(result) return result == true end,
     -- IsSuccessUpgrade = function(result) return result ~= false end,
     -- IsSuccessSell    = function(result) return result ~= false end,
@@ -85,13 +94,15 @@ local claimed = {}
 local placeInfo, placedOk = {}, {}
 
 local settings = {
-    autoPlay   = false,
-    autoReplay = false,
-    autoSpeed  = 0,        -- 0 / 1.5 / 2
-    autoVote   = false,
-    difficulty = "Medium",
-    macro      = "",
-    index      = {},       -- cadangan jika executor tanpa listfiles
+    autoPlay       = false,
+    autoReplay     = false,
+    autoSpeed      = 0,        -- 0 / 1.5 / 2
+    autoVote       = false,
+    difficulty     = "Medium",
+    macro          = "",
+    index          = {},       -- cadangan jika executor tanpa listfiles
+    deleted        = {},       -- daftar makro yang sudah di-delete (tidak ditampilkan lagi)
+    legacyImported = false,    -- impor file lama hanya sekali
 }
 
 -- forward declaration
@@ -146,7 +157,7 @@ local titleText = Instance.new("TextLabel")
 titleText.Size = UDim2.new(1, -40, 1, 0)
 titleText.Position = UDim2.new(0, 10, 0, 0)
 titleText.BackgroundTransparency = 1
-titleText.Text = "TD Macro v2"
+titleText.Text = "TD Macro v2.2"
 titleText.TextXAlignment = Enum.TextXAlignment.Left
 titleText.TextColor3 = Color3.fromRGB(235, 235, 245)
 titleText.Font = Enum.Font.GothamBold
@@ -395,7 +406,56 @@ local function readAny(v)
     return nil
 end
 
-local function makeFinder(label, pats, exactOnly)
+-- Apakah GUI object benar-benar terlihat (semua parent visible/enabled)
+local function guiVisible(o)
+    local cur = o
+    while cur and cur ~= game do
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        if cur:IsA("ScreenGui") then return cur.Enabled end
+        cur = cur.Parent
+    end
+    return true
+end
+
+-- Apakah objek berada di UI pemilihan difficulty / lobby / reward (bukan HUD wave asli)
+local function isRejectedWaveObj(d)
+    local cur = d
+    while cur and cur ~= game do
+        if cur:IsA("GuiObject") or cur:IsA("ScreenGui") or cur:IsA("Folder") then
+            if hasName(cur.Name, CONFIG.WaveRejectWords, false) then return true end
+        end
+        cur = cur.Parent
+    end
+    -- teks seperti "20 Waves" / "40 Waves" = info difficulty, bukan wave berjalan
+    if d:IsA("TextLabel") or d:IsA("TextButton") then
+        local t = string.lower(tostring(d.Text))
+        if t:match("%d+%s*waves") then return true end
+    end
+    return false
+end
+
+-- Deteksi fase pemilihan difficulty (panel vote sedang tampil)
+local votePanel, lastVP = nil, 0
+local function isVoting()
+    if CONFIG.IsVoting then
+        local ok, v = pcall(CONFIG.IsVoting)
+        return ok and v and true or false
+    end
+    if not votePanel or not votePanel.Parent then
+        votePanel = nil
+        if tick() - lastVP > 1 then
+            lastVP = tick()
+            local pg = LocalPlayer:FindFirstChild("PlayerGui")
+            if pg then votePanel = pg:FindFirstChild(CONFIG.VotePanelName, true) end
+        end
+    end
+    if votePanel and votePanel.Parent then
+        return guiVisible(votePanel)
+    end
+    return false
+end
+
+local function makeFinder(label, pats, exactOnly, reject)
     local fn, lastSearch = nil, 0
 
     local function search()
@@ -403,9 +463,13 @@ local function makeFinder(label, pats, exactOnly)
             local exact = (pass == 1)
             for _, root in ipairs({LocalPlayer, ReplicatedStorage}) do
                 for _, d in ipairs(root:GetDescendants()) do
-                    if d:IsA("ValueBase") and hasName(d.Name, pats, exact) and readAny(d) ~= nil then
+                    if d:IsA("ValueBase") and hasName(d.Name, pats, exact)
+                    and not (reject and reject(d)) and readAny(d) ~= nil then
                         log(label .. " terdeteksi: " .. d:GetFullName(), COL.warn)
-                        return function() return readAny(d) end
+                        return function()
+                            if reject and reject(d) then return nil end
+                            return readAny(d)
+                        end
                     end
                 end
             end
@@ -423,9 +487,13 @@ local function makeFinder(label, pats, exactOnly)
                     if (d:IsA("TextLabel") or d:IsA("TextButton"))
                     and hasName(d.Name, pats, exact)
                     and not d:IsDescendantOf(gui)
+                    and not (reject and reject(d))
                     and parseNum(d.Text) ~= nil then
                         log(label .. " terdeteksi: UI " .. d:GetFullName(), COL.warn)
-                        return function() return parseNum(d.Text) end
+                        return function()
+                            if reject and reject(d) then return nil end
+                            return parseNum(d.Text)
+                        end
                     end
                 end
             end
@@ -437,7 +505,7 @@ local function makeFinder(label, pats, exactOnly)
         if fn then
             local ok, v = pcall(fn)
             if ok and v ~= nil then return v end
-            fn = nil
+            fn = nil -- label ditolak / hilang -> cari ulang
         end
         if tick() - lastSearch > 3 then
             lastSearch = tick()
@@ -453,7 +521,7 @@ local function makeFinder(label, pats, exactOnly)
 end
 
 local findCash  = makeFinder("Cash",  CONFIG.CashNames)
-local findWave  = makeFinder("Wave",  CONFIG.WaveNames)
+local findWave  = makeFinder("Wave",  CONFIG.WaveNames, false, isRejectedWaveObj)
 local findSpeed = makeFinder("Speed", CONFIG.SpeedNames, true)
 
 local function safeCall(f, fallback)
@@ -471,6 +539,7 @@ end))
 
 task.spawn(function()
     local lastNewMatch = 0
+    local wasVoting = false
     while alive do
         local c = CONFIG.GetCash and safeCall(CONFIG.GetCash) or findCash()
         if type(c) == "number" then state.cash = c end
@@ -492,18 +561,38 @@ task.spawn(function()
             state.speed = 1
         end
 
-        local w = CONFIG.GetWave and safeCall(CONFIG.GetWave) or findWave()
-        if type(w) == "number" then
-            waveDetected = true
-            if w ~= state.wave then
-                local prev = state.wave
-                state.wave = w
-                state.waveTime = 0
-                log("Wave berganti -> " .. tostring(w))
-                -- wave turun ke awal = match baru
-                if w < prev and w <= 1 and tick() - lastNewMatch > 5 then
-                    lastNewMatch = tick()
-                    if onNewMatch then task.spawn(onNewMatch) end
+        -- Fase pemilihan difficulty: wave dipaksa 0, jangan baca wave apa pun
+        local voting = isVoting()
+        if voting then
+            if state.wave ~= 0 then
+                state.wave = 0
+                log("Fase pilih difficulty (wave diabaikan)", COL.warn)
+            end
+            state.waveTime = 0
+        elseif wasVoting then
+            -- panel vote hilang = match benar-benar dimulai
+            state.waveTime = 0
+            if tick() - lastNewMatch > 5 then
+                lastNewMatch = tick()
+                if onNewMatch then task.spawn(onNewMatch) end
+            end
+        end
+        wasVoting = voting
+
+        if not voting then
+            local w = CONFIG.GetWave and safeCall(CONFIG.GetWave) or findWave()
+            if type(w) == "number" then
+                waveDetected = true
+                if w ~= state.wave then
+                    local prev = state.wave
+                    state.wave = w
+                    state.waveTime = 0
+                    log("Wave berganti -> " .. tostring(w))
+                    -- wave turun ke awal = match baru
+                    if w < prev and w <= 1 and tick() - lastNewMatch > 5 then
+                        lastNewMatch = tick()
+                        if onNewMatch then task.spawn(onNewMatch) end
+                    end
                 end
             end
         end
@@ -660,6 +749,7 @@ local function loadSettings()
         end
     end
     if type(settings.index) ~= "table" then settings.index = {} end
+    if type(settings.deleted) ~= "table" then settings.deleted = {} end
     if type(settings.autoSpeed) ~= "number" then settings.autoSpeed = 0 end
     if not table.find(DIFFS, settings.difficulty) then settings.difficulty = "Medium" end
 end
@@ -687,6 +777,21 @@ local function removeIndex(name)
     if i then table.remove(settings.index, i) end
 end
 
+-- Daftar makro yang sudah dihapus (supaya tidak muncul lagi walau file gagal terhapus)
+local function isDeleted(name)
+    return table.find(settings.deleted, name) ~= nil
+end
+local function markDeleted(name)
+    if not isDeleted(name) then table.insert(settings.deleted, name) end
+end
+local function unmarkDeleted(name)
+    local i = table.find(settings.deleted, name)
+    while i do
+        table.remove(settings.deleted, i)
+        i = table.find(settings.deleted, name)
+    end
+end
+
 local function listMacros()
     local out = {}
     if listfiles and isfolder and isfolder(CONFIG.MacroDir) then
@@ -694,11 +799,17 @@ local function listMacros()
         if ok and type(files) == "table" then
             for _, f in ipairs(files) do
                 local n = tostring(f):match("([^/\\]+)%.json$")
-                if n then table.insert(out, n) end
+                if n and not isDeleted(n) and not table.find(out, n) then
+                    table.insert(out, n)
+                end
             end
         end
     else
-        for _, n in ipairs(settings.index) do table.insert(out, n) end
+        for _, n in ipairs(settings.index) do
+            if not isDeleted(n) and not table.find(out, n) then
+                table.insert(out, n)
+            end
+        end
     end
     table.sort(out, function(a, b) return string.lower(a) < string.lower(b) end)
     return out
@@ -732,6 +843,7 @@ local function saveMacro(name)
     ensureDir()
     local ok = writeJson(macroPath(name), { version = 2, steps = steps })
     if ok then
+        unmarkDeleted(name) -- disimpan ulang = tidak lagi dianggap terhapus
         addIndex(name)
         settings.macro = name
         nameBox.Text = name
@@ -754,6 +866,38 @@ local function loadMacro(name)
     refreshMacroLabel()
     log("Makro dimuat: " .. name .. " (" .. summary(steps) .. ")", COL.ok)
     return true
+end
+
+local function deleteMacro(name)
+    local path = macroPath(name)
+    local fileGone = false
+
+    -- 1) coba hapus file sungguhan
+    if delfile then pcall(delfile, path) end
+    if isfile then
+        local ok, exists = pcall(isfile, path)
+        fileGone = ok and not exists
+    end
+
+    -- 2) jika file masih ada, kosongkan isinya
+    if not fileGone and writefile then
+        pcall(writefile, path, "{}")
+    end
+
+    -- 3) catat sebagai terhapus + bersihkan index, lalu simpan permanen
+    markDeleted(name)
+    removeIndex(name)
+    settings.macro = ""
+    steps = {}
+    nameBox.Text = ""
+    saveSettings()
+    refreshMacroLabel()
+
+    if fileGone then
+        log("Makro dihapus: " .. name, COL.warn)
+    else
+        log("Makro dihapus: " .. name .. " (file tidak bisa dihapus executor, disembunyikan permanen)", COL.warn)
+    end
 end
 
 ----------------------------------------------------------------
@@ -1052,7 +1196,6 @@ end
 onNewMatch = function()
     towerInstances, instToId, claimed, active = {}, {}, {}, {}
     log("Match baru terdeteksi.", COL.warn)
-    if settings.autoVote and voteBurst then voteBurst() end
     if recording then return end
     if playing then
         stopPlay(true)
@@ -1095,16 +1238,6 @@ end)
 local END_WORDS = {"victory", "defeat", "game over", "you win", "you won", "you lose", "you lost",
                    "match complete", "match over", "mission complete", "mission failed"}
 local AGAIN_WORDS = {"again", "play again", "replay"}
-
-local function guiVisible(o)
-    local cur = o
-    while cur and cur ~= game do
-        if cur:IsA("GuiObject") and not cur.Visible then return false end
-        if cur:IsA("ScreenGui") then return cur.Enabled end
-        cur = cur.Parent
-    end
-    return true
-end
 
 local function detectMatchEnded()
     if CONFIG.IsMatchEnded then
@@ -1184,8 +1317,8 @@ task.spawn(function()
     local last = 0
     while alive do
         task.wait(1)
-        -- sebelum match mulai (wave 0), ulangi vote tiap 3 detik
-        if settings.autoVote and waveDetected and state.wave <= 0 and tick() - last > 3 then
+        -- selama panel pilih difficulty tampil, ulangi vote tiap 3 detik
+        if settings.autoVote and isVoting() and tick() - last > 3 then
             last = tick()
             voteBurst()
         end
@@ -1229,14 +1362,10 @@ saveBtn.MouseButton1Click:Connect(function()
 end)
 
 delBtn.MouseButton1Click:Connect(function()
+    if recording or playing then log("Stop Record/Play dulu.", COL.warn) return end
     local name = settings.macro
     if name == "" then log("Pilih makro dulu (◀ ▶).", COL.warn) return end
-    if delfile then pcall(delfile, macroPath(name)) end
-    removeIndex(name)
-    settings.macro = ""
-    saveSettings()
-    refreshMacroLabel()
-    log("Makro dihapus: " .. name, COL.warn)
+    deleteMacro(name)
 end)
 
 -- Tab Auto
@@ -1313,14 +1442,19 @@ end
 ----------------------------------------------------------------
 loadSettings()
 ensureDir()
+diffBtn.Text = settings.difficulty
 
--- impor file lama (tahap 1) jika belum ada makro
-if #listMacros() == 0 then
-    local legacy = readJson(CONFIG.LegacyFile)
-    if legacy and legacy[1] then
-        steps = legacy
-        saveMacro("Place_Lama")
+-- impor file lama (tahap 1): hanya SEKALI, dan tidak jika sudah pernah dihapus
+if not settings.legacyImported then
+    settings.legacyImported = true
+    if #listMacros() == 0 and not isDeleted("Place_Lama") then
+        local legacy = readJson(CONFIG.LegacyFile)
+        if legacy and legacy[1] then
+            steps = legacy
+            saveMacro("Place_Lama")
+        end
     end
+    saveSettings()
 end
 
 do
@@ -1335,7 +1469,7 @@ end
 
 refreshToggles()
 refreshButtons()
-log("TD Macro v2 siap." .. (#steps > 0 and (" Makro aktif: " .. settings.macro .. " (" .. #steps .. " step).") or ""), COL.ok)
+log("TD Macro v2.2 siap." .. (#steps > 0 and (" Makro aktif: " .. settings.macro .. " (" .. #steps .. " step).") or ""), COL.ok)
 
 -- Auto play / auto vote saat script dimuat (rejoin)
 task.spawn(function()
