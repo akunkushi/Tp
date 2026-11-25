@@ -1,8 +1,8 @@
 --[[
-    TD Macro v2.1 (Delta Mobile)
+    TD Macro v2.3 (Delta Mobile)
     Record/Play: Place, Upgrade, Sell, Target
-    Fitur: Save/Load/Delete makro, Auto Play (rejoin), Auto Replay,
-           Auto Speed 1.5x/2x, Auto Vote Difficulty (jeda 7 detik)
+    Fitur: Save/Load/Delete makro, Auto Play (rejoin), Auto Replay (retry sampai vote tercatat),
+           Auto Speed 1.5x/2x, Auto Vote Difficulty (jeda 7 detik), Anti AFK
 ]]
 
 ----------------------------------------------------------------
@@ -44,6 +44,7 @@ local RunService        = game:GetService("RunService")
 local UserInputService  = game:GetService("UserInputService")
 local HttpService       = game:GetService("HttpService")
 local CoreGui           = game:GetService("CoreGui")
+local VirtualUser       = game:GetService("VirtualUser")
 local LocalPlayer       = Players.LocalPlayer
 
 local env = (getgenv and getgenv()) or _G
@@ -66,6 +67,7 @@ local activeName, selectedName = nil, nil
 local settings = {
     selected = nil, autoPlay = false, autoReplay = false,
     autoSpeed = 0, autoVote = false, difficulty = "Medium",
+    antiAfk = false,
     deleted = {},
 }
 local DIFFS = {"Easy", "Medium", "Hard", "Insane", "Nightmare"}
@@ -133,7 +135,7 @@ local title = mk("Frame", {
 corner(title, 8)
 mk("TextLabel", {
     Size = UDim2.new(1, -40, 1, 0), Position = UDim2.new(0, 10, 0, 0), BackgroundTransparency = 1,
-    Text = "TD Macro v2.1", TextXAlignment = Enum.TextXAlignment.Left,
+    Text = "TD Macro v2.3", TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = Color3.fromRGB(235, 235, 245), Font = Enum.Font.GothamBold, TextSize = 14,
 }, title)
 local minBtn = btn(title, "–", 268, 3, 28, 22, C.gray, 16)
@@ -922,6 +924,27 @@ local function scheduleVote()
     end)
 end
 
+-- Anti AFK
+local afkConn
+local function setAntiAfk(on)
+    if afkConn then
+        pcall(function() afkConn:Disconnect() end)
+        afkConn = nil
+    end
+    if on then
+        afkConn = LocalPlayer.Idled:Connect(function()
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+            end)
+            log("Anti AFK: aktivitas dikirim (cegah kick idle).", COL.ok)
+        end)
+    end
+end
+
+----------------------------------------------------------------
+-- AUTO REPLAY (kirim "Again" berulang sampai vote tercatat)
+----------------------------------------------------------------
 local endedUntil = 0
 local END_PATS = {"matchend", "gameend", "endgame", "gameover", "matchresult", "matchover", "matchfinish", "victory", "defeat", "result"}
 do
@@ -942,49 +965,124 @@ do
 end
 
 local FRAME_PATS = {"victory", "defeat", "gameover", "matchresult", "endscreen", "matchend", "gameend", "resultsscreen"}
-local BTN_NAMES  = {"again", "playagain", "replay"}
+local BTN_NAMES  = { again = true, playagain = true, replay = true }
 
-local function isMatchEnded()
-    if CONFIG.IsMatchEnded then
-        local ok, v = pcall(CONFIG.IsMatchEnded)
-        if ok then return v and true or false, "config" end
-    end
-    if tick() < endedUntil then return true, "remote event" end
-    local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    if pg then
-        for _, d in ipairs(pg:GetDescendants()) do
-            if not d:IsDescendantOf(gui) then
-                local n = string.lower(d.Name)
-                if d:IsA("GuiButton") then
-                    local txt = d:IsA("TextButton") and string.lower(d.Text) or ""
-                    if (n == BTN_NAMES[1] or n == BTN_NAMES[2] or n == BTN_NAMES[3]
-                        or txt == "again" or txt == "play again" or txt == "replay") and isVisible(d) then
-                        return true, "tombol " .. d.Name
-                    end
-                elseif (d:IsA("GuiObject") or d:IsA("ScreenGui")) and hasName(d.Name, FRAME_PATS, false) and isVisible(d) then
-                    return true, "UI " .. d.Name
-                end
-            end
-        end
+local function ancestorHas(d, pats)
+    local cur = d.Parent
+    for _ = 1, 4 do
+        if not cur or cur == game then return false end
+        if hasName(cur.Name, pats, false) then return true end
+        cur = cur.Parent
     end
     return false
 end
 
+-- Scan layar akhir: apakah match selesai, tombol Play Again, dan status vote (mis. 0/1)
+local function scanEndUI()
+    local r = { ended = false }
+    if CONFIG.IsMatchEnded then
+        local ok, v = pcall(CONFIG.IsMatchEnded)
+        if ok and v then r.ended, r.why = true, "config" end
+    end
+    if tick() < endedUntil then r.ended, r.why = true, r.why or "remote event" end
+
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pg then return r end
+    local ownInPg = gui:IsDescendantOf(pg)
+
+    for _, d in ipairs(pg:GetDescendants()) do
+        if not (ownInPg and d:IsDescendantOf(gui)) then
+            if d:IsA("GuiButton") then
+                local txt = d:IsA("TextButton") and string.lower(stripTags(d.Text)) or ""
+                local n = string.lower(d.Name)
+                if (BTN_NAMES[n] or txt == "again" or txt == "replay"
+                    or string.find(txt, "play again", 1, true)) and isVisible(d) then
+                    r.ended, r.button = true, d
+                    r.why = r.why or ("tombol " .. d.Name)
+                end
+            elseif d:IsA("TextLabel") then
+                local txt = string.lower(stripTags(d.Text))
+                if string.find(txt, "again", 1, true) and isVisible(d) then
+                    r.ended = true
+                    r.why = r.why or ("teks " .. d.Name)
+                    local v, t = txt:match("(%d+)%s*/%s*(%d+)")
+                    if v then r.voted, r.total = tonumber(v), tonumber(t) end
+                elseif not r.voted then
+                    -- counter terpisah, mis. label "0/1" di dalam panel Play Again
+                    local v, t = txt:match("^%s*(%d+)%s*/%s*(%d+)%s*$")
+                    if v and ancestorHas(d, {"again", "replay"}) and isVisible(d) then
+                        r.voted, r.total = tonumber(v), tonumber(t)
+                    end
+                end
+            elseif (d:IsA("GuiObject") or d:IsA("ScreenGui"))
+                and hasName(d.Name, FRAME_PATS, false) and isVisible(d) then
+                r.ended = true
+                r.why = r.why or ("UI " .. d.Name)
+            end
+        end
+    end
+    return r
+end
+
+local replaying = false
 local lastReplay = 0
+
+local function doReplay(why)
+    replaying = true
+    log("Match selesai (" .. tostring(why) .. "), mengirim Again...", COL.warn)
+
+    local attempts, missing = 0, 0
+    while alive and settings.autoReplay do
+        local r = scanEndUI()
+        if not r.ended then
+            missing = missing + 1
+            if missing >= 2 then
+                log("Layar akhir hilang, replay dianggap berhasil.", COL.ok)
+                break
+            end
+        else
+            missing = 0
+            if r.voted and r.total and r.total > 0 and r.voted >= r.total then
+                log(string.format("Vote Again tercatat (%d/%d).", r.voted, r.total), COL.ok)
+                break
+            end
+            -- tanpa counter: batasi 3x supaya vote tidak ter-toggle
+            if not r.total and attempts >= 3 then
+                log("Again sudah dikirim " .. attempts .. "x (counter vote tidak terbaca).", COL.warn)
+                break
+            end
+            if attempts >= 10 then break end
+            if not R.Match then log("Remote MatchAction tidak ada.", COL.bad) break end
+
+            attempts = attempts + 1
+            pcall(function() R.Match:FireServer("Again") end)
+            if attempts == 1 then
+                log("Auto replay: Again", COL.ok)
+            else
+                log("Auto replay: Again (ulang #" .. attempts .. ")", COL.warn)
+            end
+
+            if attempts >= 3 and r.button and firesignal then
+                pcall(function() firesignal(r.button.MouseButton1Click) end)
+                pcall(function() firesignal(r.button.Activated) end)
+                log("Fallback: menekan tombol Play Again.", COL.warn)
+            end
+        end
+        task.wait(r.total and 1.5 or 3)
+    end
+
+    lastReplay = tick()
+    endedUntil = 0
+    replaying = false
+end
+
 task.spawn(function()
     while alive do
-        task.wait(2)
-        if settings.autoReplay and tick() - lastReplay > 15 then
-            local ended, why = isMatchEnded()
-            if ended then
-                log("Match selesai (" .. tostring(why) .. "), replay dalam 2 detik...", COL.warn)
-                task.wait(2)
-                if alive and settings.autoReplay and isMatchEnded() and R.Match then
-                    lastReplay = tick()
-                    endedUntil = 0
-                    pcall(function() R.Match:FireServer("Again") end)
-                    log("Auto replay: Again", COL.ok)
-                end
+        task.wait(1)
+        if settings.autoReplay and not replaying and tick() - lastReplay > 20 then
+            local r = scanEndUI()
+            if r.ended then
+                task.spawn(doReplay, r.why)
             end
         end
     end
@@ -1132,7 +1230,7 @@ end)
 -- HALAMAN AUTO (toggle)
 ----------------------------------------------------------------
 local function makeToggle(label, x, y, w, onChange)
-    local b = btn(pageAuto, label, x, y, w, 30, C.gray, 12)
+    local b = btn(pageAuto, label, x, y, w, 28, C.gray, 12)
     local on = false
     local function set(v, silent)
         on = v and true or false
@@ -1151,11 +1249,11 @@ local setAutoPlay = makeToggle("Auto Play Makro", 8, 0, 284, function(v)
     settings.autoPlay = v saveSettings()
     log("Auto Play makro: " .. (v and "ON" or "OFF"), COL.warn)
 end)
-local setAutoReplay = makeToggle("Auto Replay", 8, 36, 284, function(v)
+local setAutoReplay = makeToggle("Auto Replay", 8, 32, 284, function(v)
     settings.autoReplay = v saveSettings()
     log("Auto Replay: " .. (v and "ON" or "OFF"), COL.warn)
 end)
-setSpeed15 = makeToggle("Auto Speed x1.5", 8, 72, 284, function(v)
+setSpeed15 = makeToggle("Auto Speed x1.5", 8, 64, 284, function(v)
     if v then
         settings.autoSpeed = 1.5
         setSpeed2(false, true)
@@ -1165,7 +1263,7 @@ setSpeed15 = makeToggle("Auto Speed x1.5", 8, 72, 284, function(v)
     end
     saveSettings()
 end)
-setSpeed2 = makeToggle("Auto Speed x2", 8, 108, 284, function(v)
+setSpeed2 = makeToggle("Auto Speed x2", 8, 96, 284, function(v)
     if v then
         settings.autoSpeed = 2
         setSpeed15(false, true)
@@ -1175,11 +1273,11 @@ setSpeed2 = makeToggle("Auto Speed x2", 8, 108, 284, function(v)
     end
     saveSettings()
 end)
-local setAutoVote = makeToggle("Auto Vote", 8, 144, 170, function(v)
+local setAutoVote = makeToggle("Auto Vote", 8, 128, 170, function(v)
     settings.autoVote = v saveSettings()
     if v then scheduleVote() end
 end)
-local diffBtn = btn(pageAuto, "Diff: Medium", 182, 144, 110, 30, C.blue, 12)
+local diffBtn = btn(pageAuto, "Diff: Medium", 182, 128, 110, 28, C.blue, 12)
 diffBtn.MouseButton1Click:Connect(function()
     local idx = 1
     for i, d in ipairs(DIFFS) do if d == settings.difficulty then idx = i end end
@@ -1187,7 +1285,13 @@ diffBtn.MouseButton1Click:Connect(function()
     diffBtn.Text = "Diff: " .. settings.difficulty
     saveSettings()
 end)
-local speedModeBtn = btn(pageAuto, "Hitung speed: Auto", 8, 180, 284, 30, C.gray, 12)
+local setAntiAfkToggle = makeToggle("Anti AFK", 8, 160, 284, function(v)
+    settings.antiAfk = v
+    setAntiAfk(v)
+    saveSettings()
+    log("Anti AFK: " .. (v and "ON" or "OFF"), COL.warn)
+end)
+local speedModeBtn = btn(pageAuto, "Hitung speed: Auto", 8, 192, 284, 28, C.gray, 12)
 speedModeBtn.MouseButton1Click:Connect(function()
     if speedMode == "auto" then speedMode = 1
     elseif speedMode == 1 then speedMode = 1.5
@@ -1205,6 +1309,7 @@ env.__TDMacroCleanup = function()
     alive = false
     recording, playing = false, false
     if Shared then Shared.recording = false Shared.handlers = {} end
+    if afkConn then pcall(function() afkConn:Disconnect() end) afkConn = nil end
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
     pcall(function() gui:Destroy() end)
 end
@@ -1236,6 +1341,8 @@ task.spawn(function()
     setSpeed15(settings.autoSpeed == 1.5, true)
     setSpeed2(settings.autoSpeed == 2, true)
     setAutoVote(settings.autoVote, true)
+    setAntiAfkToggle(settings.antiAfk, true)
+    setAntiAfk(settings.antiAfk)
     diffBtn.Text = "Diff: " .. tostring(settings.difficulty)
 
     if settings.selected then
@@ -1253,7 +1360,7 @@ task.spawn(function()
     end
     refreshList()
     refreshButtons()
-    log("TD Macro v2.1 siap.", COL.ok)
+    log("TD Macro v2.3 siap." .. (settings.antiAfk and " Anti AFK ON." or ""), COL.ok)
 
     task.wait(3)
     if not alive then return end
