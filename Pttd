@@ -7,7 +7,7 @@
     - Auto Speed x1.5 / x2, Auto Replay match, Auto Vote difficulty
     - FIX: wave tidak lagi terbaca dari panel pemilihan difficulty
     - FIX: makro yang di-delete tidak muncul lagi setelah rejoin
-    - UPDATE: jeda 3 detik sebelum menjalankan auto vote difficulty
+    - UPDATE: jeda 3 detik sebelum auto vote + retry 5x setiap 1 detik
 ]]
 
 ----------------------------------------------------------------
@@ -27,7 +27,10 @@ local CONFIG = {
     PlaceMaxTries   = 0,    -- 0 = tanpa batas (tunggu cash)
     UpgradeMaxTries = 200,  -- ~80 detik, lalu dilewati
     SellMaxTries    = 10,
+
     VoteDelay       = 3,    -- jeda detik sebelum auto vote berjalan
+    VoteMaxTries    = 5,    -- maksimal percobaan auto vote
+    VoteRetryDelay  = 1,    -- jeda detik antar percobaan ulang auto vote
 
     -- Upgrade/Sell yang mengembalikan nil dianggap berhasil
     NilIsSuccess = true,
@@ -1295,7 +1298,7 @@ task.spawn(function()
     end
 end)
 
--- Auto vote difficulty (dengan jeda sebelum eksekusi)
+-- Auto vote difficulty (jeda 3s sebelum mulai, retry 5x setiap 1s)
 local voteBusy = false
 local voteGen = 0
 
@@ -1303,15 +1306,25 @@ voteBurst = function()
     if voteBusy then return end
     voteBusy = true
     task.spawn(function()
-        for _ = 1, 3 do
+        local maxTries = CONFIG.VoteMaxTries or 5
+        local retryDelay = CONFIG.VoteRetryDelay or 1
+        for attempt = 1, maxTries do
             if not alive or not settings.autoVote then break end
+            if attempt > 1 and not isVoting() then
+                log("Panel vote sudah tertutup, vote selesai.", COL.ok)
+                break
+            end
             local ev = getRemote(CONFIG.VoteRemote)
             if ev then
                 local d = settings.difficulty
                 pcall(function() ev:FireServer(d) end)
-                log("Vote difficulty: " .. tostring(d), COL.ok)
+                log(string.format("Vote difficulty (%d/%d): %s", attempt, maxTries, tostring(d)), COL.ok)
+            else
+                log(string.format("Remote Vote tidak ketemu (%d/%d), mencoba lagi...", attempt, maxTries), COL.warn)
             end
-            task.wait(1.5)
+            if attempt < maxTries then
+                task.wait(retryDelay)
+            end
         end
         voteBusy = false
     end)
@@ -1332,10 +1345,11 @@ end
 
 task.spawn(function()
     local last = 0
+    local cooldown = CONFIG.VoteDelay + (CONFIG.VoteMaxTries * CONFIG.VoteRetryDelay) + 1
     while alive do
         task.wait(1)
         -- selama panel pilih difficulty tampil, beri jeda sebelum vote
-        if settings.autoVote and isVoting() and tick() - last > (CONFIG.VoteDelay + 3) then
+        if settings.autoVote and isVoting() and tick() - last > cooldown then
             last = tick()
             scheduleVote(CONFIG.VoteDelay)
         end
