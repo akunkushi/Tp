@@ -2,7 +2,7 @@
     TD Macro v2.1 (Delta Mobile)
     Record/Play: Place, Upgrade, Sell, Target
     Fitur: Save/Load/Delete makro, Auto Play (rejoin), Auto Replay,
-           Auto Speed 1.5x/2x, Auto Vote Difficulty (jeda 5 detik)
+           Auto Speed 1.5x/2x, Auto Vote Difficulty (jeda 7 detik)
 ]]
 
 ----------------------------------------------------------------
@@ -20,6 +20,7 @@ local CONFIG = {
     },
     SpeedRemote  = "GameSpeed",
     RetryDelay   = 0.4,
+    VoteDelay    = 7,                    -- jeda sebelum auto vote (detik)
     MacroDir     = "TDMacros",
     SettingsFile = "TDMacro_Settings.json",
     OldFile      = "TDMacro_Place.json",
@@ -912,8 +913,8 @@ end
 
 local function scheduleVote()
     if not settings.autoVote then return end
-    log("Auto vote " .. settings.difficulty .. " dalam 5 detik...", COL.warn)
-    task.delay(5, function()
+    log("Auto vote " .. settings.difficulty .. " dalam " .. CONFIG.VoteDelay .. " detik...", COL.warn)
+    task.delay(CONFIG.VoteDelay, function()
         if alive and settings.autoVote and R.Vote then
             pcall(function() R.Vote:FireServer(settings.difficulty) end)
             log("Auto vote difficulty: " .. settings.difficulty, COL.ok)
