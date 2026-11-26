@@ -1,8 +1,9 @@
 --[[
-    TD Macro v2.3 (Delta Mobile)
+    TD Macro v2.4 (Delta Mobile)
     Record/Play: Place, Upgrade, Sell, Target
-    Fitur: Save/Load/Delete makro, Auto Play (rejoin), Auto Replay (retry sampai vote tercatat),
-           Auto Speed 1.5x/2x, Auto Vote Difficulty (jeda 7 detik), Anti AFK
+    Fitur: Save/Load/Delete makro, Auto Play (rejoin), Auto Replay,
+           Auto Speed 1.5x/2x, Auto Vote Difficulty (jeda 7 detik),
+           Anti AFK (+ simulasi aktivitas), Match-End Guard, Log sesi lalu
 ]]
 
 ----------------------------------------------------------------
@@ -18,12 +19,14 @@ local CONFIG = {
         Match   = "MatchAction",
         Vote    = "DifficultyVote",
     },
-    SpeedRemote  = "GameSpeed",
-    RetryDelay   = 0.4,
-    VoteDelay    = 7,                    -- jeda sebelum auto vote (detik)
-    MacroDir     = "TDMacros",
-    SettingsFile = "TDMacro_Settings.json",
-    OldFile      = "TDMacro_Place.json",
+    SpeedRemote      = "GameSpeed",
+    RetryDelay       = 0.4,
+    VoteDelay        = 7,                -- jeda sebelum auto vote (detik)
+    ActivityInterval = 25,               -- interval simulasi aktivitas (detik)
+    MacroDir         = "TDMacros",
+    SettingsFile     = "TDMacro_Settings.json",
+    LogFile          = "TDMacro_LastLog.txt",
+    OldFile          = "TDMacro_Place.json",
 
     CashNames  = {"cash", "money", "coins", "gold"},
     SpeedNames = {"gamespeed", "speed"},
@@ -47,6 +50,9 @@ local CoreGui           = game:GetService("CoreGui")
 local VirtualUser       = game:GetService("VirtualUser")
 local LocalPlayer       = Players.LocalPlayer
 
+local VIM
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
 local env = (getgenv and getgenv()) or _G
 if env.__TDMacroCleanup then pcall(env.__TDMacroCleanup) end
 
@@ -60,6 +66,7 @@ local function track(c) table.insert(connections, c) return c end
 local state = { wave = 0, waveTime = 0, cash = nil, speed = 1, remoteSpeed = nil }
 local speedMode = "auto"
 local recording, playing = false, false
+local matchOver, lastEnd = false, 0
 local runToken = 0
 local steps = {}
 local towerInstances, instToId, claimed, nameById = {}, {}, {}, {}
@@ -135,7 +142,7 @@ local title = mk("Frame", {
 corner(title, 8)
 mk("TextLabel", {
     Size = UDim2.new(1, -40, 1, 0), Position = UDim2.new(0, 10, 0, 0), BackgroundTransparency = 1,
-    Text = "TD Macro v2.3", TextXAlignment = Enum.TextXAlignment.Left,
+    Text = "TD Macro v2.4", TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = Color3.fromRGB(235, 235, 245), Font = Enum.Font.GothamBold, TextSize = 14,
 }, title)
 local minBtn = btn(title, "–", 268, 3, 28, 22, C.gray, 16)
@@ -218,11 +225,25 @@ local function addLine(text, color)
 end
 
 local function fmtCash(c) return c and tostring(math.floor(c)) or "?" end
+
+-- Log juga disimpan ke file (untuk diagnosis setelah teleport)
+local logBuf, logDirty = {}, false
 local function log(msg, color)
     local line = string.format("[W%s %.1fs $%s] %s",
         tostring(state.wave), state.waveTime, fmtCash(state.cash), msg)
     print("[TDMacro] " .. line)
     addLine(line, color)
+    table.insert(logBuf, os.date("%H:%M:%S") .. " " .. line)
+    if #logBuf > 60 then table.remove(logBuf, 1) end
+    logDirty = true
+end
+
+-- Baca log sesi sebelumnya SEKARANG (sebelum tertimpa)
+local prevLog
+if isfile and readfile then
+    pcall(function()
+        if isfile(CONFIG.LogFile) then prevLog = readfile(CONFIG.LogFile) end
+    end)
 end
 
 local minimized = false
@@ -298,7 +319,7 @@ local function writeMacro(name)
         writefile(macroPath(name), HttpService:JSONEncode({ version = 2, steps = steps }))
     end)
     if ok and settings.deleted[name] then
-        settings.deleted[name] = nil   -- nama dipakai lagi, hapus penanda "terhapus"
+        settings.deleted[name] = nil
         saveSettings()
     end
     return ok
@@ -392,7 +413,6 @@ end
 
 local function stripTags(s) return (tostring(s):gsub("<[^>]+>", "")) end
 
--- UI yang berhubungan dengan vote/difficulty TIDAK boleh dipakai membaca wave
 local function inBlockedUI(d)
     local cur = d
     while cur and cur ~= game do
@@ -405,7 +425,6 @@ local function inBlockedUI(d)
     return false
 end
 
--- Baca wave dari teks seperti "WAVE 1/25". "20 Waves" TIDAK akan cocok.
 local function waveFromText(text, strict)
     local s = string.lower(stripTags(text))
     local n = s:match("wave%s*(%d+)%s*/%s*%d+")
@@ -415,6 +434,13 @@ local function waveFromText(text, strict)
         if n then return tonumber(n) end
     end
     return nil
+end
+
+local function argsToStr(t)
+    local parts = {}
+    local n = t.n or #t
+    for i = 1, n do parts[#parts + 1] = tostring(t[i]) end
+    return table.concat(parts, ", ")
 end
 
 ----------------------------------------------------------------
@@ -476,7 +502,6 @@ local function makeFinder(label, pats, exactOnly)
     end
 end
 
--- Finder khusus WAVE (hanya nama persis / teks "Wave X/Y")
 local function makeWaveFinder()
     local fn, lastSearch = nil, 0
     local WN = {"wave", "currentwave"}
@@ -788,7 +813,8 @@ end
 ----------------------------------------------------------------
 -- PLAY
 ----------------------------------------------------------------
-local function active(tok) return playing and tok == runToken end
+-- makro dianggap tidak aktif jika match sedang berakhir
+local function active(tok) return playing and tok == runToken and not matchOver end
 
 local function waitFor(tok, cond)
     while active(tok) and not cond() do task.wait(0.05) end
@@ -812,6 +838,7 @@ local function getTowerInst(id, tok)
     return nil
 end
 
+-- retry dengan backoff supaya tidak spam server
 local function retryInvoke(tok, label, fn)
     local tries = 0
     while active(tok) do
@@ -822,7 +849,9 @@ local function retryInvoke(tok, label, fn)
             log(string.format("%s gagal (percobaan %d), menunggu cash... result: %s",
                 label, tries, ok and tostring(res) or "error"), COL.warn)
         end
-        task.wait(CONFIG.RetryDelay)
+        local delay = CONFIG.RetryDelay
+        if tries > 5 then delay = math.min(1.0, CONFIG.RetryDelay + (tries - 5) * 0.1) end
+        task.wait(delay)
     end
     return false
 end
@@ -837,6 +866,14 @@ end
 
 local function startPlay()
     if #steps == 0 then log("Belum ada makro (Record atau Load dulu).", COL.bad) return end
+    if not R.Place then
+        log("Bukan di dalam match (remote PlaceTower tidak ada), makro tidak dijalankan.", COL.warn)
+        return
+    end
+    if matchOver then
+        log("Match sedang berakhir, makro tidak dijalankan.", COL.warn)
+        return
+    end
     runToken = runToken + 1
     local tok = runToken
     playing = true
@@ -906,7 +943,7 @@ end
 ----------------------------------------------------------------
 local function applySpeed()
     local v = settings.autoSpeed
-    if v and v > 0 and SpeedRemote then
+    if v and v > 0 and SpeedRemote and not matchOver then
         pcall(function() SpeedRemote:FireServer(v) end)
         state.remoteSpeed = v
         log("Auto speed -> x" .. tostring(v), COL.ok)
@@ -917,14 +954,16 @@ local function scheduleVote()
     if not settings.autoVote then return end
     log("Auto vote " .. settings.difficulty .. " dalam " .. CONFIG.VoteDelay .. " detik...", COL.warn)
     task.delay(CONFIG.VoteDelay, function()
-        if alive and settings.autoVote and R.Vote then
+        if alive and settings.autoVote and R.Vote and not matchOver then
             pcall(function() R.Vote:FireServer(settings.difficulty) end)
             log("Auto vote difficulty: " .. settings.difficulty, COL.ok)
         end
     end)
 end
 
--- Anti AFK
+----------------------------------------------------------------
+-- ANTI AFK (Idled + simulasi aktivitas supaya tidak dianggap AFK oleh game)
+----------------------------------------------------------------
 local afkConn
 local function setAntiAfk(on)
     if afkConn then
@@ -942,10 +981,82 @@ local function setAntiAfk(on)
     end
 end
 
+local activityCount = 0
+local function simulateActivity()
+    activityCount = activityCount + 1
+
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+
+    if VIM then
+        pcall(function()
+            local vs = workspace.CurrentCamera.ViewportSize
+            VIM:SendMouseMoveEvent(vs.X * 0.5 + math.random(-15, 15),
+                                   vs.Y * 0.5 + math.random(-15, 15), game)
+        end)
+        pcall(function()
+            VIM:SendKeyEvent(true, Enum.KeyCode.RightControl, false, game)
+            task.wait(0.05)
+            VIM:SendKeyEvent(false, Enum.KeyCode.RightControl, false, game)
+        end)
+    end
+
+    -- gerakan karakter kecil, hanya saat di dalam match (bukan di lobby/AFK zone)
+    if R.Place then
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 then
+            pcall(function() hum.Jump = true end)
+            task.spawn(function()
+                pcall(function()
+                    local t0 = tick()
+                    while tick() - t0 < 0.25 do
+                        hum:Move(Vector3.new(1, 0, 0), false)
+                        RunService.Heartbeat:Wait()
+                    end
+                    t0 = tick()
+                    while tick() - t0 < 0.25 do
+                        hum:Move(Vector3.new(-1, 0, 0), false)
+                        RunService.Heartbeat:Wait()
+                    end
+                    hum:Move(Vector3.new(0, 0, 0), false)
+                end)
+            end)
+        end
+    end
+
+    if activityCount == 1 or activityCount % 10 == 0 then
+        log("Simulasi aktivitas (anti AFK game) #" .. activityCount)
+    end
+end
+
+task.spawn(function()
+    task.wait(10)
+    while alive do
+        if (settings.antiAfk or playing or settings.autoPlay) and not recording then
+            simulateActivity()
+        end
+        task.wait(CONFIG.ActivityInterval)
+    end
+end)
+
 ----------------------------------------------------------------
--- AUTO REPLAY (kirim "Again" berulang sampai vote tercatat)
+-- MATCH-END GUARD + AUTO REPLAY
 ----------------------------------------------------------------
 local endedUntil = 0
+
+local function markMatchOver(why)
+    if matchOver then return end
+    matchOver = true
+    lastEnd = tick()
+    if playing then
+        stopPlay(true)
+        log("Match selesai (" .. tostring(why) .. "), makro dihentikan.", COL.warn)
+    end
+end
+
 local END_PATS = {"matchend", "gameend", "endgame", "gameover", "matchresult", "matchover", "matchfinish", "victory", "defeat", "result"}
 do
     local roots = { ReplicatedStorage }
@@ -957,6 +1068,7 @@ do
                 track(r.OnClientEvent:Connect(function()
                     endedUntil = tick() + 20
                     log("Event match selesai dari remote: " .. r.Name, COL.warn)
+                    markMatchOver("remote " .. r.Name)
                 end))
                 log("Memantau remote match-end: " .. r.Name)
             end
@@ -977,7 +1089,6 @@ local function ancestorHas(d, pats)
     return false
 end
 
--- Scan layar akhir: apakah match selesai, tombol Play Again, dan status vote (mis. 0/1)
 local function scanEndUI()
     local r = { ended = false }
     if CONFIG.IsMatchEnded then
@@ -1008,7 +1119,6 @@ local function scanEndUI()
                     local v, t = txt:match("(%d+)%s*/%s*(%d+)")
                     if v then r.voted, r.total = tonumber(v), tonumber(t) end
                 elseif not r.voted then
-                    -- counter terpisah, mis. label "0/1" di dalam panel Play Again
                     local v, t = txt:match("^%s*(%d+)%s*/%s*(%d+)%s*$")
                     if v and ancestorHas(d, {"again", "replay"}) and isVisible(d) then
                         r.voted, r.total = tonumber(v), tonumber(t)
@@ -1046,7 +1156,6 @@ local function doReplay(why)
                 log(string.format("Vote Again tercatat (%d/%d).", r.voted, r.total), COL.ok)
                 break
             end
-            -- tanpa counter: batasi 3x supaya vote tidak ter-toggle
             if not r.total and attempts >= 3 then
                 log("Again sudah dikirim " .. attempts .. "x (counter vote tidak terbaca).", COL.warn)
                 break
@@ -1076,22 +1185,34 @@ local function doReplay(why)
     replaying = false
 end
 
+-- Watcher: deteksi akhir match tiap 1 detik
+local endStreak = 0
 task.spawn(function()
     while alive do
         task.wait(1)
-        if settings.autoReplay and not replaying and tick() - lastReplay > 20 then
-            local r = scanEndUI()
-            if r.ended then
+        local r = scanEndUI()
+        if r.ended then
+            endStreak = endStreak + 1
+            if endStreak >= 2 or r.why == "remote event" then
+                markMatchOver(r.why)
+            end
+            if settings.autoReplay and not replaying and tick() - lastReplay > 20 then
                 task.spawn(doReplay, r.why)
+            end
+        else
+            endStreak = 0
+            if matchOver and tick() - lastEnd > 3 then
+                matchOver = false
             end
         end
     end
 end)
 
+-- Re-assert speed berkala (tidak saat match berakhir)
 task.spawn(function()
     while alive do
         task.wait(20)
-        if settings.autoSpeed > 0 then
+        if settings.autoSpeed > 0 and not matchOver then
             pcall(function() SpeedRemote:FireServer(settings.autoSpeed) end)
             state.remoteSpeed = settings.autoSpeed
         end
@@ -1099,6 +1220,12 @@ task.spawn(function()
 end)
 
 local function onNewMatch()
+    task.wait(3)   -- verifikasi dulu, jangan langsung percaya wave yang tiba-tiba reset
+    if not alive then return end
+    if matchOver or (tick() - lastEnd) < 5 or state.wave > 1 or scanEndUI().ended then
+        log("Wave kembali ke awal saat fase akhir match, diabaikan (bukan match baru).", COL.warn)
+        return
+    end
     log("Match baru terdeteksi.", COL.warn)
     endedUntil = 0
     if not recording then
@@ -1110,6 +1237,35 @@ local function onNewMatch()
         stopPlay(true)
         task.delay(0.5, function() if alive and not recording then startPlay() end end)
     end
+end
+
+----------------------------------------------------------------
+-- MONITOR REMOTE "AFK" (diagnosis)
+----------------------------------------------------------------
+local function onAfkRemote(args, _, _, _, mine)
+    log("REMOTE AFK dipanggil (" .. (mine and "oleh skrip" or "oleh game") .. "): "
+        .. argsToStr(args), COL.warn)
+end
+
+local function monitorAfkRemotes()
+    local n = 0
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if n >= 6 then break end
+        local isEvent, isFunc = d:IsA("RemoteEvent"), d:IsA("RemoteFunction")
+        if (isEvent or isFunc) and string.find(string.lower(d.Name), "afk", 1, true) then
+            n = n + 1
+            log("Remote AFK ditemukan: " .. d:GetFullName(), COL.warn)
+            if isEvent then
+                addHandler(d, "FireServer", onAfkRemote, true)
+                track(d.OnClientEvent:Connect(function(...)
+                    log("Server -> klien [" .. d.Name .. "]: " .. argsToStr(table.pack(...)), COL.warn)
+                end))
+            else
+                addHandler(d, "InvokeServer", onAfkRemote, true)
+            end
+        end
+    end
+    if n == 0 then log("Tidak ada remote bernama 'afk' di ReplicatedStorage.") end
 end
 
 ----------------------------------------------------------------
@@ -1144,9 +1300,10 @@ task.spawn(function()
             if w < oldW and w <= 1 then task.spawn(onNewMatch) end
         end
 
-        info.Text = string.format("W%s | $%s | x%s%s | %s",
+        info.Text = string.format("W%s | $%s | x%s%s | %s%s",
             tostring(state.wave), fmtCash(state.cash), tostring(state.speed),
-            type(speedMode) == "number" and "(m)" or "", activeName or "-")
+            type(speedMode) == "number" and "(m)" or "", activeName or "-",
+            matchOver and " | END" or "")
         task.wait(0.1)
     end
 end)
@@ -1210,12 +1367,10 @@ delBtn.MouseButton1Click:Connect(function()
     local n = selectedName
     local p = macroPath(n)
 
-    -- 1) tandai "terhapus permanen" DULU (agar tidak pernah muncul lagi)
     settings.deleted[n] = true
     if settings.selected == n then settings.selected = nil end
     saveSettings()
 
-    -- 2) hapus file fisik
     if delfile then pcall(function() delfile(p) end) end
     if isfile and isfile(p) and delfile then pcall(function() delfile(p) end) end
 
@@ -1318,14 +1473,34 @@ end
 -- STARTUP
 ----------------------------------------------------------------
 task.spawn(function()
+    -- tampilkan log sesi sebelumnya (berguna setelah teleport ke AFK zone)
+    if prevLog and #prevLog > 0 then
+        local lines = {}
+        for l in prevLog:gmatch("[^\n]+") do table.insert(lines, l) end
+        addLine("== Log sesi sebelumnya (" .. math.min(12, #lines) .. " baris terakhir) ==", COL.warn)
+        for i = math.max(1, #lines - 11), #lines do
+            addLine(lines[i], Color3.fromRGB(150, 155, 170))
+        end
+        addLine("== Akhir log sesi sebelumnya ==", COL.warn)
+    end
+
+    -- penulis log ke file (batch tiap 0.5 detik)
+    task.spawn(function()
+        while alive do
+            task.wait(0.5)
+            if logDirty and writefile then
+                logDirty = false
+                pcall(function() writefile(CONFIG.LogFile, table.concat(logBuf, "\n")) end)
+            end
+        end
+    end)
+
     loadSettings()
 
-    -- File lama v1: dihapus (tidak dimigrasi lagi, ini penyebab makro muncul kembali)
     if isfile and isfile(CONFIG.OldFile) and delfile then
         pcall(delfile, CONFIG.OldFile)
     end
 
-    -- Pastikan makro yang pernah dihapus benar-benar hilang
     for name in pairs(settings.deleted) do
         local p = macroPath(name)
         if isfile and isfile(p) and delfile then pcall(delfile, p) end
@@ -1360,14 +1535,22 @@ task.spawn(function()
     end
     refreshList()
     refreshButtons()
-    log("TD Macro v2.3 siap." .. (settings.antiAfk and " Anti AFK ON." or ""), COL.ok)
+    pcall(monitorAfkRemotes)
+    log("TD Macro v2.4 siap." .. (settings.antiAfk and " Anti AFK ON." or ""), COL.ok)
 
     task.wait(3)
     if not alive then return end
     if settings.autoSpeed > 0 then applySpeed() end
     scheduleVote()
     if settings.autoPlay and #steps > 0 and not recording then
-        log("Auto Play makro: " .. tostring(activeName), COL.ok)
-        startPlay()
+        -- jangan mulai makro kalau layar akhir match sedang tampil
+        for _ = 1, 10 do
+            if not scanEndUI().ended then break end
+            task.wait(1)
+        end
+        if alive and not matchOver then
+            log("Auto Play makro: " .. tostring(activeName), COL.ok)
+            startPlay()
+        end
     end
 end)
