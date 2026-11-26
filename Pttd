@@ -29,8 +29,8 @@ local CONFIG = {
     RetryDelay       = 0.4,
     VoteDelay        = 7,                -- jeda sebelum auto vote (detik)
     ActivityInterval = 25,               -- interval anti AFK ringan (detik)
-    GapMin           = 0.8,              -- jeda minimum antar aksi (detik)
-    GapMax           = 2.2,
+    GapMin           = 0.5,              -- jeda minimum antar aksi (detik)
+    GapMax           = 1.1,
     PosJitter        = 0.25,             -- geser posisi place (studs); 0 = mati
     MacroDir         = "TDMacros",
     SettingsFile     = "TDMacro_Settings.json",
